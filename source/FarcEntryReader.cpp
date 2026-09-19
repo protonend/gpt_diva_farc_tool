@@ -39,19 +39,15 @@
 //   Bone Mapping Analysis
 //
 // 今回の重要修正 :
-//   ObjBin::AnalyzeBoneMapping() は現行宣言に合わせて
+//   Skin解析は AnalyzeSkin() ではなく
+//   AnalyzeAllSkins() を使用する。
 //
-//       analysis
-//       skinResult
-//       decompressedData
-//       boneMappingResult
+//   AnalyzeAllSkins() は OBJ.BIN 全体の AnalysisResult から
+//   SkinAnalysisResult を構築する。
 //
-//   の4引数を受け取る。
+//   Bone Mapping Analyzerには、そのまま skinResult を渡す。
 //
-//   直前の AnalyzeSkin() で取得した skinResult を
-//   Mapping Analyzerへそのまま渡す。
-//
-//   SkinをMapping Analyzer内で再解析しない。
+//   Mapping Analyzer内でSkinを再解析しない。
 //
 // 今回やらないこと :
 //   C4D Joint生成
@@ -624,7 +620,7 @@ namespace GPTDiva
 		GePrint(
 			"\n"
 			"############################################################\n"
-			"### GPTDIVA FarcEntryReader::ReadEntry() ENTERED ###\n"
+			"### GPTDiva FarcEntryReader::ReadEntry() ENTERED ###\n"
 			"############################################################\n"
 		);
 
@@ -962,10 +958,16 @@ namespace GPTDiva
 		GPTDiva::ObjBin::SkinAnalysisResult skinResult;
 
 
-		if (!GPTDiva::ObjBin::AnalyzeSkin(
+		// --------------------------------------------------------------------
+		// IMPORTANT:
+		//   AnalyzeSkin() is the single/low-level Skin analysis interface.
+		//   SkinAnalysisResult for the complete OBJ.BIN is built by
+		//   AnalyzeAllSkins().
+		// --------------------------------------------------------------------
+
+		if (!GPTDiva::ObjBin::AnalyzeAllSkins(
 			result.decompressedData,
-			analysis.objects,
-			(UInt32)analysis.objects.size(),
+			analysis,
 			skinResult
 		))
 		{
@@ -1187,7 +1189,7 @@ namespace GPTDiva
 		//   3. std::vector<UChar>
 		//   4. BoneMappingAnalysisResult
 		//
-		// AnalyzeSkin()で既に取得した skinResult を
+		// AnalyzeAllSkins() で取得した skinResult を
 		// Mapping Analyzerへそのまま渡す。
 		//
 		// Mapping Analyzer内でSkinを再解析しない。

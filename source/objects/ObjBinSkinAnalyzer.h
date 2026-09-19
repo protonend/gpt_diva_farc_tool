@@ -3,46 +3,54 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   MikuMikuLibrary.Objects.Skin.cs を基準として、OBJ.BIN内の
-//   Object -> Skin -> Bone 情報を解析する。
+//   MikuMikuLibrary の Skin.Read() を基準として、OBJ.BIN の Skin 情報を
+//   共通形式で保持する。
 //
-//   Classic OBJ.BINでは Skin 内の ReadOffset() がグローバル
-//   BaseOffset = 0 の状態で解決されるため、Skin内部の各Offsetは
-//   skinOffsetへ加算せず、そのまま論理データ位置として扱う。
+//   主な情報:
 //
-// 解析対象:
-//   - Skin Offset
-//   - Bone Count
-//   - Bone ID
-//   - IsEx
-//   - Inverse Bind Pose Matrix
-//   - Bone Name
-//   - Parent ID
-//   - EX Data Header
+//     Skin Header
+//       -> Bone IDs
+//       -> Inverse Bind Pose Matrix
+//       -> Bone Names
+//       -> Bone Parent IDs
 //
-// 今回やらないこと:
-//   - C4D Joint生成
-//   - Skin Deformer生成
-//   - Weight接続
-//   - EX Block本体解析
-//   - Osage本体解析
-//   - Cloth本体解析
+//   また、現在のプロジェクトで使用されている
+//   SkinAnalysisResult を定義する。
+//   これにより BoneMapping / JointBuilder / FarcEntryReader
+//   から同じ解析結果を参照できる。
 //
 // Stage:
 //   OBJ.BIN
 //     -> ObjectSet
 //     -> Object
-//     -> Skin
-//     -> Bone
+//     -> Skin Offset
+//     -> Skin Header
+//     -> Skin.Bones[]
 //
-// ============================================================================
+// 今回やらないこと:
+//   C4D Joint生成
+//   C4D CAWeightTag生成
+//   C4D Skin Deformer生成
+//   BlendWeight接続
+//   BlendIndex最終確定
+//   Bind Matrixの座標変換
+//   EX Data詳細解析
+//   Material
+//   Texture
+//
+// 次段階:
+//   Skin.Bones[] の実 Bone ID / Name / Parent / Matrix を
+//   Bone Mapping 側へ接続する。
+//
+// Primary Reference:
+//   MikuMikuLibrary/MikuMikuLibrary/Objects/Skin.cs
+//
+// ============================================================
 
 #ifndef GPT_DIVA_FARC_TOOL_OBJ_BIN_SKIN_ANALYZER_H__
 #define GPT_DIVA_FARC_TOOL_OBJ_BIN_SKIN_ANALYZER_H__
 
 #include "c4d.h"
-
-#include "ObjBinAnalyzer.h"
 
 #include <string>
 #include <vector>
@@ -53,173 +61,357 @@ namespace GPTDiva
 	namespace ObjBin
 	{
 
-		// ====================================================================
-		// Skin Bone
-		// ====================================================================
+		// ============================================================
+		// Forward Declaration
+		//
+		// ObjBinAnalyzer.h の実体をここでは必要としない。
+		// ============================================================
+
+		struct ObjectInfo;
+		struct AnalysisResult;
+
+
+		// ============================================================
+		// Skin Bone Information
+		//
+		// MikuMikuLibrary BoneInfo 相当。
+		// ============================================================
 
 		struct SkinBoneInfo
 		{
-			UInt32 id;
+			// --------------------------------------------------------
+			// Skin.Bones[] の配列位置
+			// --------------------------------------------------------
 
-			Bool isEx;
+			UInt32
+				arrayIndex;
 
-			std::string name;
 
-			UInt32 parentId;
+			// --------------------------------------------------------
+			// MikuMikuLibrary BoneInfo.Id
+			// --------------------------------------------------------
 
-			Bool hasParent;
+			UInt32
+				id;
 
-			Float32 inverseBindPose[16];
 
+			// --------------------------------------------------------
+			// MikuMikuLibrary BoneInfo.IsEx
+			//
+			// (id & 0x8000) != 0
+			// --------------------------------------------------------
+
+			Bool
+				isEx;
+
+
+			// --------------------------------------------------------
+			// Bone Name
+			// --------------------------------------------------------
+
+			std::string
+				name;
+
+
+			// --------------------------------------------------------
+			// Parent ID
+			//
+			// 0xFFFFFFFF = no parent
+			// --------------------------------------------------------
+
+			UInt32
+				parentId;
+
+
+			// --------------------------------------------------------
+			// 解決済み Parent の Skin.Bones[] index
+			//
+			// -1 = no parent / unresolved
+			// --------------------------------------------------------
+
+			Int32
+				parentArrayIndex;
+
+
+			// --------------------------------------------------------
+			// Inverse Bind Pose Matrix
+			//
+			// 4 x 4 = 16 Float32
+			//
+			// FARC Native 値をそのまま保持。
+			// ========================================================
+
+			Float32
+				inverseBindPose[16];
+
+
+			// --------------------------------------------------------
+			// Constructor
+			// --------------------------------------------------------
 
 			SkinBoneInfo()
-				: id(0)
+				: arrayIndex(0)
+				, id(0xFFFFFFFFU)
 				, isEx(false)
 				, name()
 				, parentId(0xFFFFFFFFU)
-				, hasParent(false)
+				, parentArrayIndex(-1)
 			{
-				for (Int32 i = 0; i < 16; ++i)
+				for (Int32 i = 0;
+					i < 16;
+					++i)
 				{
-					inverseBindPose[i] = 0.0f;
+					inverseBindPose[i] =
+						0.0f;
 				}
 			}
 		};
 
 
-		// ====================================================================
-		// EX Data Header
-		// ====================================================================
-
-		struct SkinExDataInfo
-		{
-			Bool present;
-
-			UInt32 osageCount;
-			UInt32 osageNodeCount;
-
-			UInt32 osageNodesOffset;
-			UInt32 osageNamesOffset;
-			UInt32 blocksOffset;
-
-			UInt32 stringCount;
-			UInt32 stringsOffset;
-
-			UInt32 osageSiblingInfosOffset;
-
-			UInt32 clothCount;
-
-
-			SkinExDataInfo()
-				: present(false)
-				, osageCount(0)
-				, osageNodeCount(0)
-				, osageNodesOffset(0)
-				, osageNamesOffset(0)
-				, blocksOffset(0)
-				, stringCount(0)
-				, stringsOffset(0)
-				, osageSiblingInfosOffset(0)
-				, clothCount(0)
-			{
-			}
-		};
-
-
-		// ====================================================================
+		// ============================================================
 		// Skin Information
-		// ====================================================================
+		//
+		// 1 Object の Skin。
+		// ============================================================
 
 		struct SkinInfo
 		{
-			Bool valid;
+			// --------------------------------------------------------
+			// Object Skin Offset
+			// --------------------------------------------------------
 
-			UInt32 objectIndex;
+			UInt32
+				skinOffset;
 
-			// OBJ.BIN全体に対するSkin位置。
-			UInt32 skinOffset;
 
-			// Skin.cs の ReadOffset() で得られる
-			// OBJ.BIN全体基準のOffset。
-			UInt32 boneIdsOffset;
-			UInt32 boneMatricesOffset;
-			UInt32 boneNamesOffset;
-			UInt32 exDataOffset;
-			UInt32 boneParentIdsOffset;
+			// --------------------------------------------------------
+			// Skin Header
+			// --------------------------------------------------------
 
-			UInt32 boneCount;
+			UInt32
+				boneIdsOffset;
 
-			std::vector<SkinBoneInfo> bones;
+			UInt32
+				boneMatricesOffset;
 
-			SkinExDataInfo exData;
+			UInt32
+				boneNamesOffset;
 
+			UInt32
+				exDataOffset;
+
+			UInt32
+				boneCount;
+
+			UInt32
+				boneParentIdsOffset;
+
+
+			// --------------------------------------------------------
+			// Parsed Bones
+			// --------------------------------------------------------
+
+			std::vector<SkinBoneInfo>
+				bones;
+
+
+			// --------------------------------------------------------
+			// Compatibility Bone ID array
+			//
+			// 現在の BoneMapping 側から直接参照できるように
+			// Skin.Bones[].Id と同じ順序で保持する。
+			// --------------------------------------------------------
+
+			std::vector<UInt32>
+				boneIds;
+
+
+			// --------------------------------------------------------
+			// Compatibility Parent ID array
+			// --------------------------------------------------------
+
+			std::vector<UInt32>
+				parentIds;
+
+
+			// --------------------------------------------------------
+			// Validation
+			// --------------------------------------------------------
+
+			Bool
+				valid;
+
+			Bool
+				headerValid;
+
+			Bool
+				boneIdsValid;
+
+			Bool
+				boneMatricesValid;
+
+			Bool
+				boneNamesValid;
+
+			Bool
+				boneParentsValid;
+
+
+			// --------------------------------------------------------
+			// Constructor
+			// --------------------------------------------------------
 
 			SkinInfo()
-				: valid(false)
-				, objectIndex(0)
-				, skinOffset(0)
+				: skinOffset(0)
 				, boneIdsOffset(0)
 				, boneMatricesOffset(0)
 				, boneNamesOffset(0)
 				, exDataOffset(0)
-				, boneParentIdsOffset(0)
 				, boneCount(0)
+				, boneParentIdsOffset(0)
 				, bones()
-				, exData()
+				, boneIds()
+				, parentIds()
+				, valid(false)
+				, headerValid(false)
+				, boneIdsValid(false)
+				, boneMatricesValid(false)
+				, boneNamesValid(false)
+				, boneParentsValid(false)
 			{
 			}
 		};
 
 
-		// ====================================================================
-		// Complete Skin Analysis
-		// ====================================================================
+		// ============================================================
+		// SkinAnalysisResult
+		//
+		// IMPORTANT:
+		//
+		// 現在の
+		//
+		//   FarcEntryReader
+		//   ObjBinBoneMappingAnalyzer
+		//   ObjBinJointBuilder
+		//
+		// が共通で参照する結果型。
+		//
+		// 前回これを定義せず SkinInfo だけを返していたため、
+		// C4430 / C2065 / C2228 が連鎖していた。
+		// ============================================================
 
 		struct SkinAnalysisResult
 		{
-			Bool success;
+			// --------------------------------------------------------
+			// Overall result
+			// --------------------------------------------------------
 
-			UInt32 skinObjectCount;
+			Bool
+				success;
 
-			UInt32 totalBoneCount;
 
-			UInt32 exDataObjectCount;
+			// --------------------------------------------------------
+			// Object count
+			// --------------------------------------------------------
 
-			UInt32 totalExBlockCount;
+			UInt32
+				objectCount;
 
-			std::vector<SkinInfo> skins;
 
+			// --------------------------------------------------------
+			// Skin object count
+			// --------------------------------------------------------
+
+			UInt32
+				skinObjectCount;
+
+
+			// --------------------------------------------------------
+			// Total Bone Count
+			// --------------------------------------------------------
+
+			UInt32
+				totalBoneCount;
+
+
+			// --------------------------------------------------------
+			// EX Data Object Count
+			//
+			// 現時点では EX Data 詳細解析は行わない。
+			// EX Data Offset != 0 の Skin Object 数だけ記録する。
+			// --------------------------------------------------------
+
+			UInt32
+				exDataObjectCount;
+
+
+			// --------------------------------------------------------
+			// Per Object Skin Results
+			// --------------------------------------------------------
+
+			std::vector<SkinInfo>
+				skins;
+
+
+			// --------------------------------------------------------
+			// Constructor
+			// --------------------------------------------------------
 
 			SkinAnalysisResult()
 				: success(false)
+				, objectCount(0)
 				, skinObjectCount(0)
 				, totalBoneCount(0)
 				, exDataObjectCount(0)
-				, totalExBlockCount(0)
 				, skins()
 			{
 			}
 		};
 
 
-		// ====================================================================
-		// Analyze
-		// ====================================================================
+		// ============================================================
+		// Analyze one Object
+		// ============================================================
 
 		Bool AnalyzeSkin(
 			const std::vector<UChar>& data,
-			const std::vector<ObjectInfo>& objects,
-			UInt32 objectCount,
+			const ObjectInfo& object,
+			SkinInfo& result
+		);
+
+
+		// ============================================================
+		// Analyze all Object skins
+		// ============================================================
+
+		Bool AnalyzeAllSkins(
+			const std::vector<UChar>& data,
+			const AnalysisResult& analysis,
 			SkinAnalysisResult& result
 		);
 
 
-		// ====================================================================
-		// Print
-		// ====================================================================
+		// ============================================================
+		// Compatibility overload
+		//
+		// 旧コードが vector<SkinInfo> を直接渡している場合に対応。
+		// ============================================================
 
-		void PrintSkinAnalysis(
-			const SkinAnalysisResult& result
+		Bool AnalyzeAllSkins(
+			const std::vector<UChar>& data,
+			const AnalysisResult& analysis,
+			std::vector<SkinInfo>& results
+		);
+
+
+		// ============================================================
+		// Print Skin Information
+		// ============================================================
+
+		void PrintSkinInfo(
+			UInt32 objectIndex,
+			const ObjectInfo& object,
+			const SkinInfo& skin
 		);
 
 	}

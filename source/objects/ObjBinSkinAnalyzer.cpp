@@ -3,36 +3,41 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   MikuMikuLibrary.Objects.Skin.cs を基準として、OBJ.BIN内の
-//   Skin / Bone 情報を解析する。
+//   MikuMikuLibrary Skin.Read() 相当の OBJ.BIN Skin 解析。
 //
-// 重要:
-//   Classic ObjectSetでは、Skin.Read() の各 ReadOffset() は
-//   Skin自身の位置をBaseOffsetとして使用しない。
-//   ObjectSet.Read() の objectSkinsOffset からSkinへ移動した時点でも
-//   BaseOffsetは0のため、Skin内部のOffsetはOBJ.BIN全体基準である。
+//   Skin Header
+//     -> Bone IDs
+//     -> Inverse Bind Pose Matrix
+//     -> Bone Names
+//     -> Bone Parent IDs
 //
-//   したがって:
+//   解析結果を SkinAnalysisResult にまとめる。
 //
-//       WRONG:
-//       skinOffset + boneIdsOffset
-//
-//       CORRECT:
-//       boneIdsOffset
+// Important:
+//   - FARC Native の Matrix 値は変更しない。
+//   - Bone Array Index と Bone ID を分離する。
+//   - EX Data の詳細解釈はまだ行わない。
+//   - C4D Joint / Skin はまだ生成しない。
 //
 // Stage:
-//   OBJ.BIN
-//     -> Object
-//     -> Skin
+//   Skin
+//     -> Skin Header
 //     -> Bone IDs
 //     -> Inverse Bind Pose
-//     -> Bone Names
+//     -> Names
 //     -> Parent IDs
-//     -> EX Data Header
 //
-// ============================================================================
+// 次段階:
+//   BoneMapping へ Skin.Bones[] を接続する。
+//
+// Primary Reference:
+//   MikuMikuLibrary/MikuMikuLibrary/Objects/Skin.cs
+//
+// ============================================================
 
 #include "ObjBinSkinAnalyzer.h"
+
+#include "ObjBinAnalyzer.h"
 
 #include <cstring>
 
@@ -42,20 +47,68 @@ namespace GPTDiva
 	namespace ObjBin
 	{
 
-		// ====================================================================
+		// ============================================================
+		// Build Marker
+		// ============================================================
+
+		static const char* const
+			SKIN_ANALYZER_BUILD_MARKER =
+			"GPT_DIVA_FARC_OBJBIN_SKIN_STAGE19_FIX_20260920";
+
+
+		// ============================================================
+		// Skin Header Size
+		//
+		// Skin.Read():
+		//
+		//   boneIdsOffset
+		//   boneMatricesOffset
+		//   boneNamesOffset
+		//   exDataOffset
+		//   boneCount
+		//   boneParentIdsOffset
+		//
+		//   SkipNulls(3 * AddressSpaceSize)
+		//
+		// Classic 32-bit:
+		//   6 * 4 + 3 * 4 = 36 = 0x24
+		// ============================================================
+
+		static const UInt32
+			SKIN_HEADER_SIZE =
+			0x24;
+
+
+		static const UInt32
+			BONE_PARENT_NONE =
+			0xFFFFFFFFU;
+
+
+		static const UInt32
+			MAX_SKIN_BONE_COUNT =
+			10000;
+
+
+		static const UInt32
+			MAX_BONE_NAME_LENGTH =
+			4096;
+
+
+		// ============================================================
 		// Binary Reader
-		// ====================================================================
+		// ============================================================
 
 		class SkinBinaryReader
 		{
 		private:
 
-			const std::vector<UChar>& _data;
+			const std::vector<UChar>&
+				_data;
 
 
 		public:
 
-			SkinBinaryReader(
+			explicit SkinBinaryReader(
 				const std::vector<UChar>& data
 			)
 				: _data(data)
@@ -71,7 +124,8 @@ namespace GPTDiva
 					return 0xFFFFFFFFU;
 				}
 
-				return (UInt32)_data.size();
+				return
+					(UInt32)_data.size();
 			}
 
 
@@ -80,12 +134,19 @@ namespace GPTDiva
 				UInt32 size
 			) const
 			{
-				const UInt64 end =
-					(UInt64)offset +
-					(UInt64)size;
+				if (offset >
+					Size())
+				{
+					return false;
+				}
 
-				return end <=
-					(UInt64)Size();
+				if (size >
+					Size() - offset)
+				{
+					return false;
+				}
+
+				return true;
 			}
 
 
@@ -101,20 +162,29 @@ namespace GPTDiva
 					return false;
 				}
 
-				value =
+				const UInt32 b0 =
 					(UInt32)_data[
-						(size_t)offset + 0]
-					|
-							((UInt32)_data[
-								(size_t)offset + 1] << 8)
-							|
-									((UInt32)_data[
-										(size_t)offset + 2] << 16)
-									|
-											((UInt32)_data[
-												(size_t)offset + 3] << 24);
+						(size_t)offset + 0];
 
-										return true;
+				const UInt32 b1 =
+					(UInt32)_data[
+						(size_t)offset + 1];
+
+				const UInt32 b2 =
+					(UInt32)_data[
+						(size_t)offset + 2];
+
+				const UInt32 b3 =
+					(UInt32)_data[
+						(size_t)offset + 3];
+
+				value =
+					b0 |
+					(b1 << 8) |
+					(b2 << 16) |
+					(b3 << 24);
+
+				return true;
 			}
 
 
@@ -123,7 +193,8 @@ namespace GPTDiva
 				Float32& value
 			) const
 			{
-				UInt32 raw = 0;
+				UInt32 raw =
+					0;
 
 				if (!ReadUInt32(
 					offset,
@@ -132,92 +203,187 @@ namespace GPTDiva
 					return false;
 				}
 
+				float f =
+					0.0f;
+
 				std::memcpy(
-					&value,
+					&f,
 					&raw,
-					sizeof(Float32));
+					sizeof(float)
+				);
+
+				value =
+					(Float32)f;
 
 				return true;
 			}
 
 
-			Bool ReadStringAtOffset(
+			Bool ReadNullTerminatedString(
 				UInt32 offset,
 				std::string& value
 			) const
 			{
 				value.clear();
 
-				if (offset == 0)
-				{
-					return true;
-				}
 
-				if (offset >= Size())
+				if (offset == 0)
 				{
 					return false;
 				}
 
-				UInt32 remaining =
-					Size() - offset;
 
-				if (remaining > 4096)
+				if (offset >=
+					Size())
 				{
-					remaining = 4096;
+					return false;
 				}
 
-				for (
-					UInt32 i = 0;
-					i < remaining;
+
+				for (UInt32 i = 0;
+					i < MAX_BONE_NAME_LENGTH;
 					++i)
 				{
+					const UInt64 current64 =
+						(UInt64)offset +
+						(UInt64)i;
+
+
+					if (current64 >=
+						(UInt64)Size())
+					{
+						return false;
+					}
+
+
 					const UChar c =
 						_data[
-							(size_t)offset + i];
+							(size_t)current64
+						];
+
 
 					if (c == 0)
 					{
-						break;
+						return true;
 					}
 
+
 					value.push_back(
-						(char)c);
+						(char)c
+					);
 				}
 
-				return true;
+
+				return false;
 			}
 		};
 
 
-		// ====================================================================
-		// Skin Header
-		//
-		// Skin.cs:
-		//
-		//   long boneIdsOffset = reader.ReadOffset();
-		//   long boneMatricesOffset = reader.ReadOffset();
-		//   long boneNamesOffset = reader.ReadOffset();
-		//   long exDataOffset = reader.ReadOffset();
-		//   int boneCount = reader.ReadInt32();
-		//   long boneParentIdsOffset = reader.ReadOffset();
-		//
-		// Classic AddressSpace.Int32:
-		//   4 * 6 = 24 bytes
-		//
-		// Skin.cs then:
-		//
-		//   reader.SkipNulls(3 * reader.AddressSpace.GetByteSize());
-		//
-		// => 12 bytes padding
-		//
-		// ====================================================================
+		// ============================================================
+		// Offset calculation
+		// ============================================================
 
-		static const UInt32 SKIN_HEADER_SIZE = 24;
+		static Bool AddMul(
+			UInt32 base,
+			UInt32 index,
+			UInt32 stride,
+			UInt32& result
+		)
+		{
+			const UInt64 value =
+				(UInt64)base +
+				(UInt64)index *
+				(UInt64)stride;
 
 
-		// ====================================================================
+			if (value >
+				0xFFFFFFFFULL)
+			{
+				return false;
+			}
+
+
+			result =
+				(UInt32)value;
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// String utilities
+		// ============================================================
+
+		static String UInt32ToString(
+			UInt32 value
+		)
+		{
+			return
+				String::IntToString(
+				(Int64)value
+				);
+		}
+
+
+		static String Int32ToString(
+			Int32 value
+		)
+		{
+			return
+				String::IntToString(
+				(Int64)value
+				);
+		}
+
+
+		static String Float32ToString(
+			Float32 value
+		)
+		{
+			return
+				String::FloatToString(
+				(Float)value
+				);
+		}
+
+
+		static String ToC4DString(
+			const std::string& value
+		)
+		{
+			String result;
+
+
+			for (size_t i = 0;
+				i < value.size();
+				++i)
+			{
+				const UChar c =
+					(UChar)value[i];
+
+
+				if (c == 0)
+				{
+					break;
+				}
+
+
+				result +=
+					String(
+						1,
+						(Utf32Char)c
+					);
+			}
+
+
+			return result;
+		}
+
+
+		// ============================================================
 		// Parse Skin Header
-		// ====================================================================
+		// ============================================================
 
 		static Bool ParseSkinHeader(
 			const SkinBinaryReader& reader,
@@ -232,12 +398,14 @@ namespace GPTDiva
 				return false;
 			}
 
+
 			if (!reader.ReadUInt32(
 				skinOffset + 0,
 				skin.boneIdsOffset))
 			{
 				return false;
 			}
+
 
 			if (!reader.ReadUInt32(
 				skinOffset + 4,
@@ -246,12 +414,14 @@ namespace GPTDiva
 				return false;
 			}
 
+
 			if (!reader.ReadUInt32(
 				skinOffset + 8,
 				skin.boneNamesOffset))
 			{
 				return false;
 			}
+
 
 			if (!reader.ReadUInt32(
 				skinOffset + 12,
@@ -260,12 +430,14 @@ namespace GPTDiva
 				return false;
 			}
 
+
 			if (!reader.ReadUInt32(
 				skinOffset + 16,
 				skin.boneCount))
 			{
 				return false;
 			}
+
 
 			if (!reader.ReadUInt32(
 				skinOffset + 20,
@@ -274,71 +446,95 @@ namespace GPTDiva
 				return false;
 			}
 
+
+			if (skin.boneCount >
+				MAX_SKIN_BONE_COUNT)
+			{
+				return false;
+			}
+
+
 			return true;
 		}
 
 
-		// ====================================================================
-		// Validate Offset
-		// ====================================================================
-
-		static Bool ValidateOffset(
-			const SkinBinaryReader& reader,
-			UInt32 offset,
-			UInt32 minimumSize
-		)
-		{
-			if (offset == 0)
-			{
-				return true;
-			}
-
-			return reader.CanRead(
-				offset,
-				minimumSize);
-		}
-
-
-		// ====================================================================
+		// ============================================================
 		// Parse Bone IDs
-		// ====================================================================
+		// ============================================================
 
 		static Bool ParseBoneIDs(
 			const SkinBinaryReader& reader,
 			SkinInfo& skin
 		)
 		{
+			skin.bones.clear();
+			skin.boneIds.clear();
+
+
 			if (skin.boneCount == 0)
 			{
+				skin.boneIdsValid =
+					true;
+
 				return true;
 			}
 
-			const UInt64 start =
-				(UInt64)skin.boneIdsOffset;
 
-			const UInt64 size =
+			if (skin.boneIdsOffset == 0)
+			{
+				return false;
+			}
+
+
+			const UInt64 end =
+				(UInt64)skin.boneIdsOffset +
 				(UInt64)skin.boneCount * 4ULL;
 
-			if (start + size >
+
+			if (end >
 				(UInt64)reader.Size())
 			{
 				return false;
 			}
 
-			skin.bones.resize(
-				(size_t)skin.boneCount);
 
-			for (
-				UInt32 i = 0;
+			try
+			{
+				skin.bones.resize(
+					(size_t)skin.boneCount
+				);
+
+				skin.boneIds.resize(
+					(size_t)skin.boneCount
+				);
+			}
+			catch (...)
+			{
+				return false;
+			}
+
+
+			for (UInt32 i = 0;
 				i < skin.boneCount;
 				++i)
 			{
-				UInt32 id = 0;
+				UInt32 offset =
+					0;
 
-				const UInt32 offset =
-					(UInt32)(
-						start +
-						(UInt64)i * 4ULL);
+
+				if (!AddMul(
+					skin.boneIdsOffset,
+					i,
+					4,
+					offset))
+				{
+					return false;
+				}
+
+
+				UInt32 id =
+					BONE_PARENT_NONE;
+
 
 				if (!reader.ReadUInt32(
 					offset,
@@ -347,24 +543,43 @@ namespace GPTDiva
 					return false;
 				}
 
-				skin.bones[
-					(size_t)i].id =
+
+				SkinBoneInfo& bone =
+					skin.bones[
+						(size_t)i
+					];
+
+
+				bone.arrayIndex =
+					i;
+
+
+				bone.id =
 					id;
 
-					skin.bones[
-						(size_t)i].isEx =
-						(id & 0x8000U) != 0;
+
+				bone.isEx =
+					((id & 0x8000U) != 0);
+
+
+				skin.boneIds[
+					(size_t)i
+				] =
+					id;
 			}
+
+
+			skin.boneIdsValid =
+				true;
+
 
 			return true;
 		}
 
 
-		// ====================================================================
-		// Parse Inverse Bind Pose Matrices
-		//
-		// Matrix4x4 = 16 x float = 64 bytes.
-		// ====================================================================
+		// ============================================================
+		// Parse Inverse Bind Pose
+		// ============================================================
 
 		static Bool ParseBoneMatrices(
 			const SkinBinaryReader& reader,
@@ -373,68 +588,87 @@ namespace GPTDiva
 		{
 			if (skin.boneCount == 0)
 			{
+				skin.boneMatricesValid =
+					true;
+
 				return true;
 			}
 
-			const UInt64 start =
-				(UInt64)skin.boneMatricesOffset;
 
-			const UInt64 size =
-				(UInt64)skin.boneCount *
-				64ULL;
+			if (skin.boneMatricesOffset == 0)
+			{
+				return false;
+			}
 
-			if (start + size >
+
+			const UInt64 end =
+				(UInt64)skin.boneMatricesOffset +
+				(UInt64)skin.boneCount * 64ULL;
+
+
+			if (end >
 				(UInt64)reader.Size())
 			{
 				return false;
 			}
 
-			for (
-				UInt32 boneIndex = 0;
-				boneIndex < skin.boneCount;
-				++boneIndex)
-			{
-				for (
-					UInt32 matrixIndex = 0;
-					matrixIndex < 16;
-					++matrixIndex)
-				{
-					const UInt32 offset =
-						(UInt32)(
-							start +
-							(UInt64)boneIndex * 64ULL +
-							(UInt64)matrixIndex * 4ULL);
 
-					if (!reader.ReadFloat32(
-						offset,
-						skin.bones[
-							(size_t)boneIndex].
-						inverseBindPose[
-							matrixIndex]))
+			for (UInt32 i = 0;
+				i < skin.boneCount;
+				++i)
+			{
+				const UInt64 base64 =
+					(UInt64)skin.boneMatricesOffset +
+					(UInt64)i * 64ULL;
+
+
+				for (Int32 m = 0;
+					m < 16;
+					++m)
+				{
+					const UInt64 offset64 =
+						base64 +
+						(UInt64)m * 4ULL;
+
+
+					if (offset64 >
+						0xFFFFFFFFULL)
 					{
 						return false;
 					}
+
+
+					Float32 value =
+						0.0f;
+
+
+					if (!reader.ReadFloat32(
+						(UInt32)offset64,
+						value))
+					{
+						return false;
+					}
+
+
+					skin.bones[
+						(size_t)i
+					].inverseBindPose[m] =
+							value;
 				}
 			}
+
+
+			skin.boneMatricesValid =
+				true;
+
 
 			return true;
 		}
 
 
-		// ====================================================================
+		// ============================================================
 		// Parse Bone Names
-		//
-		// Skin.cs:
-		//
-		//   foreach (var bone in Bones)
-		//       bone.Name =
-		//           reader.ReadStringOffset(...);
-		//
-		// ReadStringOffset() also uses BaseOffset + offset.
-		// Classic Skin.Read() has BaseOffset = 0.
-		//
-		// Therefore name offsets are also global OBJ.BIN offsets.
-		// ====================================================================
+		// ============================================================
 
 		static Bool ParseBoneNames(
 			const SkinBinaryReader& reader,
@@ -443,32 +677,52 @@ namespace GPTDiva
 		{
 			if (skin.boneCount == 0)
 			{
+				skin.boneNamesValid =
+					true;
+
 				return true;
 			}
 
-			const UInt64 table =
-				(UInt64)skin.boneNamesOffset;
 
-			const UInt64 tableSize =
+			if (skin.boneNamesOffset == 0)
+			{
+				return false;
+			}
+
+
+			const UInt64 tableEnd =
+				(UInt64)skin.boneNamesOffset +
 				(UInt64)skin.boneCount * 4ULL;
 
-			if (table + tableSize >
+
+			if (tableEnd >
 				(UInt64)reader.Size())
 			{
 				return false;
 			}
 
-			for (
-				UInt32 i = 0;
+
+			for (UInt32 i = 0;
 				i < skin.boneCount;
 				++i)
 			{
-				UInt32 nameOffset = 0;
+				UInt32 tableOffset =
+					0;
 
-				const UInt32 tableOffset =
-					(UInt32)(
-						table +
-						(UInt64)i * 4ULL);
+
+				if (!AddMul(
+					skin.boneNamesOffset,
+					i,
+					4,
+					tableOffset))
+				{
+					return false;
+				}
+
+
+				UInt32 nameOffset =
+					0;
+
 
 				if (!reader.ReadUInt32(
 					tableOffset,
@@ -477,65 +731,105 @@ namespace GPTDiva
 					return false;
 				}
 
-				if (nameOffset == 0)
-				{
-					skin.bones[
-						(size_t)i].name.clear();
 
-						continue;
-				}
+				std::string name;
 
-				if (!reader.ReadStringAtOffset(
+
+				if (!reader.ReadNullTerminatedString(
 					nameOffset,
-					skin.bones[
-						(size_t)i].name))
+					name))
 				{
 					return false;
 				}
+
+
+				skin.bones[
+					(size_t)i
+				].name =
+					name;
 			}
+
+
+			skin.boneNamesValid =
+				true;
+
 
 			return true;
 		}
 
 
-		// ====================================================================
+		// ============================================================
 		// Parse Parent IDs
-		// ====================================================================
+		// ============================================================
 
 		static Bool ParseBoneParents(
 			const SkinBinaryReader& reader,
 			SkinInfo& skin
 		)
 		{
+			skin.parentIds.clear();
+
+
 			if (skin.boneCount == 0)
 			{
+				skin.boneParentsValid =
+					true;
+
 				return true;
 			}
 
-			const UInt64 start =
-				(UInt64)skin.boneParentIdsOffset;
 
-			const UInt64 size =
+			if (skin.boneParentIdsOffset == 0)
+			{
+				return false;
+			}
+
+
+			const UInt64 end =
+				(UInt64)skin.boneParentIdsOffset +
 				(UInt64)skin.boneCount * 4ULL;
 
-			if (start + size >
+
+			if (end >
 				(UInt64)reader.Size())
 			{
 				return false;
 			}
 
-			for (
-				UInt32 i = 0;
+
+			try
+			{
+				skin.parentIds.resize(
+					(size_t)skin.boneCount
+				);
+			}
+			catch (...)
+			{
+				return false;
+			}
+
+
+			for (UInt32 i = 0;
 				i < skin.boneCount;
 				++i)
 			{
-				UInt32 parentId =
-					0xFFFFFFFFU;
+				UInt32 offset =
+					0;
 
-				const UInt32 offset =
-					(UInt32)(
-						start +
-						(UInt64)i * 4ULL);
+
+				if (!AddMul(
+					skin.boneParentIdsOffset,
+					i,
+					4,
+					offset))
+				{
+					return false;
+				}
+
+
+				UInt32 parentId =
+					BONE_PARENT_NONE;
+
 
 				if (!reader.ReadUInt32(
 					offset,
@@ -544,143 +838,135 @@ namespace GPTDiva
 					return false;
 				}
 
-				skin.bones[
-					(size_t)i].parentId =
+
+				SkinBoneInfo& bone =
+					skin.bones[
+						(size_t)i
+					];
+
+
+				bone.parentId =
 					parentId;
 
-					skin.bones[
-						(size_t)i].hasParent =
-						parentId != 0xFFFFFFFFU;
+
+				bone.parentArrayIndex =
+					-1;
+
+
+				skin.parentIds[
+					(size_t)i
+				] =
+					parentId;
+
+
+					if (parentId ==
+						BONE_PARENT_NONE)
+					{
+						continue;
+					}
+
+
+					// ----------------------------------------------------
+					// MikuMikuLibrary と同じ考え方:
+					//
+					// Parent ID を Bone.Id と比較して解決する。
+					// ----------------------------------------------------
+
+					for (UInt32 p = 0;
+						p < skin.boneCount;
+						++p)
+					{
+						if (skin.bones[
+							(size_t)p
+						].id ==
+							parentId)
+						{
+							bone.parentArrayIndex =
+								(Int32)p;
+
+							break;
+						}
+					}
 			}
+
+
+			skin.boneParentsValid =
+				true;
+
 
 			return true;
 		}
 
 
-		// ====================================================================
-		// Parse EX Data Header
-		//
-		// Skin.cs:
-		//
-		//   int osageCount
-		//   int osageNodeCount
-		//   uint padding
-		//   offset osageNodes
-		//   offset osageNames
-		//   offset blocks
-		//   int stringCount
-		//   offset strings
-		//   offset osageSiblingInfos
-		//   int clothCount
-		//
-		// Classic AddressSpace.Int32:
-		//   40 bytes
-		//
-		// EX Data offsets are also global because Skin.Read()
-		// does not establish a new BaseOffset.
-		// ====================================================================
+		// ============================================================
+		// Validate
+		// ============================================================
 
-		static Bool ParseExDataHeader(
-			const SkinBinaryReader& reader,
-			SkinInfo& skin
+		static Bool ValidateSkin(
+			const SkinInfo& skin
 		)
 		{
-			if (skin.exDataOffset == 0)
-			{
-				return true;
-			}
-
-			const UInt32 exBase =
-				skin.exDataOffset;
-
-			if (!reader.CanRead(
-				exBase,
-				40))
+			if (!skin.headerValid)
 			{
 				return false;
 			}
 
-			SkinExDataInfo& ex =
-				skin.exData;
 
-			ex.present = true;
-
-			if (!reader.ReadUInt32(
-				exBase + 0,
-				ex.osageCount))
+			if (!skin.boneIdsValid)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 4,
-				ex.osageNodeCount))
+
+			if (!skin.boneMatricesValid)
 			{
 				return false;
 			}
 
-			// +8 : padding
 
-			if (!reader.ReadUInt32(
-				exBase + 12,
-				ex.osageNodesOffset))
+			if (!skin.boneNamesValid)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 16,
-				ex.osageNamesOffset))
+
+			if (!skin.boneParentsValid)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 20,
-				ex.blocksOffset))
+
+			if (skin.bones.size() !=
+				(size_t)skin.boneCount)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 24,
-				ex.stringCount))
+
+			if (skin.boneIds.size() !=
+				(size_t)skin.boneCount)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 28,
-				ex.stringsOffset))
+
+			if (skin.parentIds.size() !=
+				(size_t)skin.boneCount)
 			{
 				return false;
 			}
 
-			if (!reader.ReadUInt32(
-				exBase + 32,
-				ex.osageSiblingInfosOffset))
-			{
-				return false;
-			}
-
-			if (!reader.ReadUInt32(
-				exBase + 36,
-				ex.clothCount))
-			{
-				return false;
-			}
 
 			return true;
 		}
 
 
-		// ====================================================================
-		// Analyze Single Skin
-		// ====================================================================
+		// ============================================================
+		// AnalyzeSkin
+		// ============================================================
 
-		static Bool AnalyzeSingleSkin(
-			const SkinBinaryReader& reader,
-			UInt32 objectIndex,
+		Bool AnalyzeSkin(
+			const std::vector<UChar>& data,
 			const ObjectInfo& object,
 			SkinInfo& result
 		)
@@ -688,43 +974,91 @@ namespace GPTDiva
 			result =
 				SkinInfo();
 
-			result.objectIndex =
-				objectIndex;
 
 			result.skinOffset =
 				object.skinOffset;
 
-			// ------------------------------------------------------------
-			// Skin無しObject
-			// ------------------------------------------------------------
+
+			GePrint(
+				"============================================================\n"
+				"GPT DIVA FARC TOOL : MML SKIN ANALYZER\n"
+				"============================================================\n"
+			);
+
+
+			GePrint(
+				"BUILD : " +
+				String(
+					SKIN_ANALYZER_BUILD_MARKER
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Object Name : " +
+				ToC4DString(
+					object.name
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Skin Offset : " +
+				UInt32ToString(
+					object.skinOffset
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"OBJ.BIN Size : " +
+				UInt32ToString(
+				(UInt32)data.size()
+				) +
+				"\n"
+			);
+
+
+			// --------------------------------------------------------
+			// No Skin
+			// --------------------------------------------------------
 
 			if (object.skinOffset == 0)
 			{
-				result.valid = true;
+				GePrint(
+					"Skin : NONE\n"
+				);
+
+				result.valid =
+					true;
 
 				return true;
 			}
 
 
-			// ------------------------------------------------------------
-			// Skin本体位置
-			// ------------------------------------------------------------
-
-			if (!reader.CanRead(
-				object.skinOffset,
-				SKIN_HEADER_SIZE))
+			if ((UInt64)object.skinOffset >=
+				(UInt64)data.size())
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Skin header out of range\n");
+					"SKIN ANALYSIS : FAILED\n"
+					"Reason : Skin offset outside OBJ.BIN\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// Skin Header
-			// ------------------------------------------------------------
+			SkinBinaryReader reader(
+				data
+			);
+
+
+			// --------------------------------------------------------
+			// Header
+			// --------------------------------------------------------
 
 			if (!ParseSkinHeader(
 				reader,
@@ -732,639 +1066,591 @@ namespace GPTDiva
 				result))
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Skin header parse failed\n");
+					"SKIN HEADER : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// Diagnostic
-			// ------------------------------------------------------------
+			result.headerValid =
+				true;
+
 
 			GePrint(
-				"SKIN OFFSET : ");
+				"------------------------------------------------------------\n"
+				"SKIN HEADER\n"
+				"------------------------------------------------------------\n"
+				"Bone IDs Offset : "
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.skinOffset));
-
-			GePrint("\n");
-
-			GePrint(
-				"BONE IDS OFFSET : ");
+				UInt32ToString(
+					result.boneIdsOffset
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.boneIdsOffset));
-
-			GePrint("\n");
+				"\nBone Matrices Offset : "
+			);
 
 			GePrint(
-				"BONE MATRICES OFFSET : ");
+				UInt32ToString(
+					result.boneMatricesOffset
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.boneMatricesOffset));
-
-			GePrint("\n");
+				"\nBone Names Offset : "
+			);
 
 			GePrint(
-				"BONE NAMES OFFSET : ");
+				UInt32ToString(
+					result.boneNamesOffset
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.boneNamesOffset));
-
-			GePrint("\n");
+				"\nEX Data Offset : "
+			);
 
 			GePrint(
-				"EX DATA OFFSET : ");
+				UInt32ToString(
+					result.exDataOffset
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.exDataOffset));
-
-			GePrint("\n");
+				"\nBone Count : "
+			);
 
 			GePrint(
-				"BONE COUNT : ");
+				UInt32ToString(
+					result.boneCount
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.boneCount));
-
-			GePrint("\n");
+				"\nBone Parent IDs Offset : "
+			);
 
 			GePrint(
-				"BONE PARENT IDS OFFSET : ");
+				UInt32ToString(
+					result.boneParentIdsOffset
+				)
+			);
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.boneParentIdsOffset));
-
-			GePrint("\n");
+				"\n"
+			);
 
 
-			// ------------------------------------------------------------
-			// Validate tables
-			// ------------------------------------------------------------
-
-			if (!ValidateOffset(
-				reader,
-				result.boneIdsOffset,
-				result.boneCount * 4U))
-			{
-				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone ID table out of range\n");
-
-				return false;
-			}
-
-
-			if (!ValidateOffset(
-				reader,
-				result.boneMatricesOffset,
-				result.boneCount * 64U))
-			{
-				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone matrix table out of range\n");
-
-				return false;
-			}
-
-
-			if (!ValidateOffset(
-				reader,
-				result.boneNamesOffset,
-				result.boneCount * 4U))
-			{
-				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone name table out of range\n");
-
-				return false;
-			}
-
-
-			if (!ValidateOffset(
-				reader,
-				result.boneParentIdsOffset,
-				result.boneCount * 4U))
-			{
-				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone parent table out of range\n");
-
-				return false;
-			}
-
-
-			// ------------------------------------------------------------
+			// --------------------------------------------------------
 			// Bone IDs
-			// ------------------------------------------------------------
+			// --------------------------------------------------------
 
 			if (!ParseBoneIDs(
 				reader,
 				result))
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone ID parse failed\n");
+					"Bone IDs : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// Inverse Bind Pose
-			// ------------------------------------------------------------
+			// --------------------------------------------------------
+			// Matrices
+			// --------------------------------------------------------
 
 			if (!ParseBoneMatrices(
 				reader,
 				result))
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone matrix parse failed\n");
+					"Inverse Bind Pose Matrices : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// Bone Names
-			// ------------------------------------------------------------
+			// --------------------------------------------------------
+			// Names
+			// --------------------------------------------------------
 
 			if (!ParseBoneNames(
 				reader,
 				result))
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone name parse failed\n");
+					"Bone Names : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// Parent IDs
-			// ------------------------------------------------------------
+			// --------------------------------------------------------
+			// Parents
+			// --------------------------------------------------------
 
 			if (!ParseBoneParents(
 				reader,
 				result))
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"Bone parent parse failed\n");
+					"Bone Parents : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			// ------------------------------------------------------------
-			// EX Data
-			// ------------------------------------------------------------
+			result.valid =
+				ValidateSkin(
+					result
+				);
 
-			if (!ParseExDataHeader(
-				reader,
-				result))
+
+			if (!result.valid)
 			{
 				GePrint(
-					"OBJ.BIN SKIN ERROR : "
-					"EX Data header parse failed\n");
+					"SKIN ANALYSIS : INVALID\n"
+				);
 
 				return false;
 			}
 
 
-			result.valid = true;
+			// --------------------------------------------------------
+			// Summary
+			// --------------------------------------------------------
+
+			GePrint(
+				"============================================================\n"
+				"SKIN ANALYSIS : SUCCESS\n"
+				"============================================================\n"
+			);
+
+
+			GePrint(
+				"Bone Count : " +
+				UInt32ToString(
+					result.boneCount
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Bone ID Count : " +
+				UInt32ToString(
+				(UInt32)result.boneIds.size()
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Parent ID Count : " +
+				UInt32ToString(
+				(UInt32)result.parentIds.size()
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"EX Data Offset : " +
+				UInt32ToString(
+					result.exDataOffset
+				) +
+				"\n"
+			);
+
 
 			return true;
 		}
 
 
-		// ====================================================================
-		// Analyze Skin
-		// ====================================================================
+		// ============================================================
+		// AnalyzeAllSkins
+		//
+		// Compatibility version:
+		//
+		//   SkinAnalysisResult
+		// ============================================================
 
-		Bool AnalyzeSkin(
+		Bool AnalyzeAllSkins(
 			const std::vector<UChar>& data,
-			const std::vector<ObjectInfo>& objects,
-			UInt32 objectCount,
+			const AnalysisResult& analysis,
 			SkinAnalysisResult& result
 		)
 		{
 			result =
 				SkinAnalysisResult();
 
+
+			result.objectCount =
+				(UInt32)analysis.objects.size();
+
+
 			GePrint(
-				"\n"
 				"============================================================\n"
-				"GPT DIVA FARC TOOL : MML SKIN / BONE ANALYSIS\n"
-				"============================================================\n");
+				"GPT DIVA FARC TOOL : ALL SKIN ANALYSIS\n"
+				"============================================================\n"
+			);
+
 
 			GePrint(
-				"Reference : MikuMikuLibrary Objects/Skin.cs\n");
+				"BUILD : " +
+				String(
+					SKIN_ANALYZER_BUILD_MARKER
+				) +
+				"\n"
+			);
+
 
 			GePrint(
-				"Offset Mode : CLASSIC GLOBAL BASE OFFSET\n");
+				"Object Count : " +
+				UInt32ToString(
+					result.objectCount
+				) +
+				"\n"
+			);
 
 
-			if (data.empty())
+			try
+			{
+				result.skins.resize(
+					(size_t)result.objectCount
+				);
+			}
+			catch (...)
 			{
 				GePrint(
-					"OBJ.BIN SKIN ANALYSIS : FAILED\n");
+					"SKIN RESULT VECTOR ALLOCATION : FAILED\n"
+				);
 
 				return false;
 			}
 
 
-			if (objects.size() !=
-				(size_t)objectCount)
+			Bool allValid =
+				true;
+
+
+			for (UInt32 i = 0;
+				i < result.objectCount;
+				++i)
 			{
+				const ObjectInfo& object =
+					analysis.objects[
+						(size_t)i
+					];
+
+
 				GePrint(
-					"OBJ.BIN SKIN ANALYSIS : "
-					"Object count mismatch\n");
-
-				return false;
-			}
+					"------------------------------------------------------------\n"
+				);
 
 
-			SkinBinaryReader reader(
-				data);
+				GePrint(
+					"OBJECT[" +
+					Int32ToString(
+					(Int32)i
+					) +
+					"] : " +
+					ToC4DString(
+						object.name
+					) +
+					"\n"
+				);
 
 
-			for (
-				UInt32 objectIndex = 0;
-				objectIndex < objectCount;
-				++objectIndex)
-			{
-				SkinInfo skin;
+				SkinInfo& skin =
+					result.skins[
+						(size_t)i
+					];
 
 
-				if (!AnalyzeSingleSkin(
-					reader,
-					objectIndex,
-					objects[
-						(size_t)objectIndex],
+				if (!AnalyzeSkin(
+					data,
+					object,
 					skin))
 				{
-					GePrint(
-						"OBJ.BIN SKIN ANALYSIS : "
-						"Object Skin parse failed\n");
+					allValid =
+						false;
 
-					return false;
+
+					GePrint(
+						"OBJECT SKIN : FAILED\n"
+					);
+
+
+					continue;
 				}
 
 
-						if (skin.skinOffset != 0)
-						{
-							++result.skinObjectCount;
+				// ----------------------------------------------------
+				// Skin object statistics
+				// ----------------------------------------------------
 
-							result.totalBoneCount +=
-								skin.boneCount;
-
-							if (skin.exData.present)
-							{
-								++result.exDataObjectCount;
-							}
-						}
+				if (object.skinOffset != 0)
+				{
+					++result.skinObjectCount;
 
 
-						result.skins.push_back(
-							skin);
+					result.totalBoneCount +=
+						skin.boneCount;
+
+
+					if (skin.exDataOffset != 0)
+					{
+						++result.exDataObjectCount;
+					}
+				}
+
+
+				GePrint(
+					"OBJECT SKIN : SUCCESS\n"
+				);
 			}
 
 
-			result.success = true;
+			result.success =
+				allValid;
 
 
-			PrintSkinAnalysis(
-				result);
+			GePrint(
+				"============================================================\n"
+				"ALL SKIN ANALYSIS COMPLETE\n"
+				"============================================================\n"
+			);
+
+
+			GePrint(
+				"Success : " +
+				String(
+					result.success
+					? "YES"
+					: "NO"
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Object Count : " +
+				UInt32ToString(
+					result.objectCount
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Skin Object Count : " +
+				UInt32ToString(
+					result.skinObjectCount
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"Total Bone Count : " +
+				UInt32ToString(
+					result.totalBoneCount
+				) +
+				"\n"
+			);
+
+
+			GePrint(
+				"EX Data Object Count : " +
+				UInt32ToString(
+					result.exDataObjectCount
+				) +
+				"\n"
+			);
+
+
+			return result.success;
+		}
+
+
+		// ============================================================
+		// Legacy vector overload
+		// ============================================================
+
+		Bool AnalyzeAllSkins(
+			const std::vector<UChar>& data,
+			const AnalysisResult& analysis,
+			std::vector<SkinInfo>& results
+		)
+		{
+			SkinAnalysisResult compatibility;
+
+
+			if (!AnalyzeAllSkins(
+				data,
+				analysis,
+				compatibility))
+			{
+				results =
+					compatibility.skins;
+
+				return false;
+			}
+
+
+			results =
+				compatibility.skins;
 
 
 			return true;
 		}
 
 
-		// ====================================================================
-		// Print
-		// ====================================================================
+		// ============================================================
+		// PrintSkinInfo
+		// ============================================================
 
-		void PrintSkinAnalysis(
-			const SkinAnalysisResult& result
+		void PrintSkinInfo(
+			UInt32 objectIndex,
+			const ObjectInfo& object,
+			const SkinInfo& skin
 		)
 		{
 			GePrint(
 				"============================================================\n"
-				"SKIN / BONE ANALYSIS RESULT\n"
-				"============================================================\n");
+				"SKIN BONE TABLE\n"
+				"============================================================\n"
+			);
 
 
 			GePrint(
-				"Analysis Success : ");
-
-			GePrint(
-				result.success
-				? "YES\n"
-				: "NO\n");
-
-
-			GePrint(
-				"Skin Object Count : ");
-
-			GePrint(
-				String::IntToString(
-				(Int64)result.skinObjectCount));
-
-			GePrint("\n");
+				"Object Index : " +
+				UInt32ToString(
+					objectIndex
+				) +
+				"\n"
+			);
 
 
 			GePrint(
-				"Total Bone Count : ");
+				"Object Name : " +
+				ToC4DString(
+					object.name
+				) +
+				"\n"
+			);
+
 
 			GePrint(
-				String::IntToString(
-				(Int64)result.totalBoneCount));
-
-			GePrint("\n");
-
-
-			GePrint(
-				"EX Data Object Count : ");
-
-			GePrint(
-				String::IntToString(
-				(Int64)result.exDataObjectCount));
-
-			GePrint("\n");
+				"Bone Count : " +
+				UInt32ToString(
+					skin.boneCount
+				) +
+				"\n"
+			);
 
 
-			for (
-				size_t objectIndex = 0;
-				objectIndex < result.skins.size();
-				++objectIndex)
+			for (UInt32 i = 0;
+				i < (UInt32)skin.bones.size();
+				++i)
 			{
-				const SkinInfo& skin =
-					result.skins[
-						objectIndex];
+				const SkinBoneInfo& bone =
+					skin.bones[
+						(size_t)i
+					];
 
 
 				GePrint(
-					"------------------------------------------------------------\n");
+					"[" +
+					UInt32ToString(
+						bone.arrayIndex
+					) +
+					"] "
+				);
 
 
 				GePrint(
-					"OBJECT[");
+					"ID=" +
+					UInt32ToString(
+						bone.id
+					) +
+					" "
+				);
 
 
 				GePrint(
-					String::IntToString(
-					(Int64)objectIndex));
-
-
-				GePrint(
-					"] SKIN\n");
-
-
-				GePrint(
-					"Skin Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.skinOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"Bone Count : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.boneCount));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"Bone IDs Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.boneIdsOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"Bone Matrices Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.boneMatricesOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"Bone Names Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.boneNamesOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"Parent IDs Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.boneParentIdsOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"EX Data Offset : ");
-
-
-				GePrint(
-					String::IntToString(
-					(Int64)skin.exDataOffset));
-
-
-				GePrint("\n");
-
-
-				GePrint(
-					"EX Data : ");
-
-
-				GePrint(
-					skin.exData.present
-					? "PRESENT\n"
-					: "NONE\n");
-
-
-				if (skin.exData.present)
-				{
-					GePrint(
-						"Osage Count : ");
-
-					GePrint(
-						String::IntToString(
-						(Int64)skin.exData.osageCount));
-
-					GePrint("\n");
-
-
-					GePrint(
-						"Osage Node Count : ");
-
-					GePrint(
-						String::IntToString(
-						(Int64)skin.exData.osageNodeCount));
-
-					GePrint("\n");
-
-
-					GePrint(
-						"Block Table Offset : ");
-
-					GePrint(
-						String::IntToString(
-						(Int64)skin.exData.blocksOffset));
-
-					GePrint("\n");
-
-
-					GePrint(
-						"String Count : ");
-
-					GePrint(
-						String::IntToString(
-						(Int64)skin.exData.stringCount));
-
-					GePrint("\n");
-
-
-					GePrint(
-						"Cloth Count : ");
-
-					GePrint(
-						String::IntToString(
-						(Int64)skin.exData.clothCount));
-
-					GePrint("\n");
-				}
-
-
-				const UInt32 bonePrintLimit =
-					skin.boneCount > 20
-					? 20
-					: skin.boneCount;
-
-
-				for (
-					UInt32 boneIndex = 0;
-					boneIndex < bonePrintLimit;
-					++boneIndex)
-				{
-					const SkinBoneInfo& bone =
-						skin.bones[
-							(size_t)boneIndex];
-
-
-					GePrint(
-						"  BONE[");
-
-					GePrint(
-						String::IntToString(
-						(Int64)boneIndex));
-
-					GePrint(
-						"] ID=");
-
-					GePrint(
-						String::IntToString(
-						(Int64)bone.id));
-
-					GePrint(
-						" IsEx=");
-
-					GePrint(
+					"IsEx=" +
+					String(
 						bone.isEx
-						? "TRUE"
-						: "FALSE");
-
-					GePrint(
-						" Parent=");
-
-					if (bone.hasParent)
-					{
-						GePrint(
-							String::IntToString(
-							(Int64)bone.parentId));
-					}
-					else
-					{
-						GePrint(
-							"NONE");
-					}
-
-					GePrint(
-						" Name=");
-
-					GePrint(
-						String(
-							bone.name.c_str()));
-
-					GePrint("\n");
-				}
+						? "YES"
+						: "NO"
+					) +
+					" "
+				);
 
 
-				if (skin.boneCount >
-					bonePrintLimit)
-				{
-					GePrint(
-						"  ... remaining bones : ");
+				GePrint(
+					"ParentID=" +
+					UInt32ToString(
+						bone.parentId
+					) +
+					" "
+				);
 
-					GePrint(
-						String::IntToString(
-						(Int64)(
-							skin.boneCount -
-							bonePrintLimit)));
 
-					GePrint("\n");
-				}
+				GePrint(
+					"ParentIndex=" +
+					Int32ToString(
+						bone.parentArrayIndex
+					) +
+					" "
+				);
+
+
+				GePrint(
+					"Name=" +
+					ToC4DString(
+						bone.name
+					) +
+					"\n"
+				);
+
+
+				GePrint(
+					"    InvBind : " +
+					Float32ToString(
+						bone.inverseBindPose[0]
+					) +
+					", " +
+					Float32ToString(
+						bone.inverseBindPose[1]
+					) +
+					", " +
+					Float32ToString(
+						bone.inverseBindPose[2]
+					) +
+					", " +
+					Float32ToString(
+						bone.inverseBindPose[3]
+					) +
+					" ...\n"
+				);
 			}
 
 
 			GePrint(
 				"============================================================\n"
-				"SKIN / BONE ANALYSIS COMPLETE\n"
-				"============================================================\n");
+			);
 		}
 
 	}
