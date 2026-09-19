@@ -3,310 +3,377 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   ObjBinAnalyzer が解析した MikuMikuLibrary Native TexCoord0 を
-//   Cinema 4D R19 UVWTag に接続する。
+//   ObjBinAnalyzer が解析した Native TexCoord0 を
+//   Cinema 4D R19 UVWTagへ接続する。
 //
-//   MikuMikuLibrary Classic Mesh:
-//     VertexFormatAttributes.TexCoord0 = bit 4
-//     attributeOffsets[4]
-//     Float32 U
-//     Float32 V
+// Native:
+//   MeshInfo::texCoords0
 //
-//   Native UV:
-//     (U, V)
+// C4D:
+//   UVWTag
 //
-//   UV変換:
-//     NONE
+// 座標変換:
+//   なし
 //
-//   PolygonBuilder の三角形変換:
-//     Native : A, B, C
-//     C4D    : A, C, B
+//   U -> U
+//   V -> V
 //
-//   UVWTag:
-//     A = UV[A]
-//     B = UV[C]
-//     C = UV[B]
-//     D = UV[B]
+// Polygon order:
+//   PolygonBuilderと同じ
 //
-//   C4D R19:
-//     UVWTag::Set() は戻り値を返さない。
-//     BaseObject::KillTag() は BaseTag* ではなく
-//     タグタイプIDを受け取る。
+//   Native A,B,C
+//        ↓
+//   C4D A,C,B,B
+//
+// C4D R19 UVW API:
+//   書き込み : UVWTag::SetSlow()
+//   読み出し : UVWTag::GetSlow()
 //
 // Stage:
-//   OBJ.BIN Native UV -> C4D UVWTag
+//   OBJ.BIN Native UV
+//        ↓
+//   MeshInfo::texCoords0
+//        ↓
+//   UVWTag
 //
-// 今回やらないこと:
-//   - TexCoord1～3
-//   - Modern Storage
-//   - Material
-//   - Texture
-//   - Skin
-//   - Bone
-//   - EX Data
-//   - UVの再計算
-//   - UVのV反転
-//
-// 次段階:
-//   UVWTag Read-Back Verification
-//
+// ============================================================
 
 #include "ObjBinUvBuilder.h"
 
 #include <cmath>
-#include <vector>
 
 
 namespace GPTDiva
 {
 	namespace ObjBin
 	{
+
 		// ============================================================
-		// Internal helper
+		// UV validation
 		// ============================================================
 
-		static Bool IsFiniteFloat32(const Float32 value)
+		static Bool IsValidNativeUv(
+			const Vector& uv)
 		{
-			return std::isfinite((double)value) ? true : false;
-		}
-
-
-		static Bool IsValidUV(const Vector& uv)
-		{
-			if (!IsFiniteFloat32((Float32)uv.x))
+			if (!std::isfinite(
+				(double)uv.x))
+			{
 				return false;
+			}
 
-			if (!IsFiniteFloat32((Float32)uv.y))
+
+			if (!std::isfinite(
+				(double)uv.y))
+			{
 				return false;
+			}
+
 
 			return true;
 		}
 
 
-		static String Int32String(const Int32 value)
+		// ============================================================
+		// Remove existing UVWTag
+		//
+		// Cinema 4D R19:
+		//
+		//   KillTag(Int32 type, Int32 nr)
+		// ============================================================
+
+		static void RemoveExistingUVWTag(
+			PolygonObject* object)
 		{
-			return String::IntToString(value);
-		}
+			if (!object)
+			{
+				return;
+			}
 
 
-		static void PrintSeparator()
-		{
-			GePrint(
-				String("------------------------------------------------------------")
-			);
-		}
-
-
-		static void PrintHeader()
-		{
-			GePrint(
-				String("============================================================")
-			);
-
-			GePrint(
-				String("OBJ.BIN NATIVE TEXCOORD0 -> C4D UVWTAG")
-			);
-
-			GePrint(
-				String("============================================================")
-			);
-		}
-
-
-		static void PrintFailure(const String& message)
-		{
-			GePrint(
-				String("[OBJ.BIN UV BUILDER] ERROR : ") +
-				message
-			);
+			while (object->GetTag(Tuvw))
+			{
+				object->KillTag(
+					Tuvw,
+					0
+				);
+			}
 		}
 
 
 		// ============================================================
-		// BuildUvTags
+		// Calculate polygon count
 		// ============================================================
 
-		Bool BuildUvTags(
-			const AnalysisResult& analysis,
-			const std::vector<PolygonObject*>& meshObjects,
-			UvBuildResult& result
-		)
+		static Bool GetPolygonCount(
+			const MeshInfo& mesh,
+			Int32& polygonCount)
 		{
-			// --------------------------------------------------------
-			// Result reset
-			// --------------------------------------------------------
-
-			result = UvBuildResult();
-
-			PrintHeader();
-
-			GePrint(
-				String("Analysis Success : ") +
-				(
-					analysis.success
-					? String("YES")
-					: String("NO")
-					)
-			);
-
-			GePrint(
-				String("Analysis Object Count : ") +
-				Int32String(
-				(Int32)analysis.objects.size()
-				)
-			);
-
-			GePrint(
-				String("C4D Mesh Object Count : ") +
-				Int32String(
-				(Int32)meshObjects.size()
-				)
-			);
-
-			PrintSeparator();
+			polygonCount =
+				0;
 
 
-			// --------------------------------------------------------
-			// Basic validation
-			// --------------------------------------------------------
+			UInt64 totalIndexCount =
+				0;
 
-			if (!analysis.success)
+
+			for (size_t i = 0;
+				i < mesh.subMeshes.size();
+				++i)
 			{
-				PrintFailure(
-					String("AnalysisResult is not successful.")
-				);
-
-				return false;
-			}
+				const SubMeshInfo& subMesh =
+					mesh.subMeshes[i];
 
 
-			if (meshObjects.empty())
-			{
-				PrintFailure(
-					String("C4D mesh object array is empty.")
-				);
-
-				return false;
-			}
+				const size_t count =
+					subMesh.triangleIndices.size();
 
 
-			if (analysis.objects.empty())
-			{
-				PrintFailure(
-					String("Analysis object array is empty.")
-				);
-
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Count total MeshInfo entries
-			// --------------------------------------------------------
-
-			Int32 totalMeshCount = 0;
-
-
-			for (size_t objectIndex = 0;
-				objectIndex < analysis.objects.size();
-				++objectIndex)
-			{
-				const ObjectInfo& objectInfo =
-					analysis.objects[objectIndex];
-
-
-				totalMeshCount +=
-					(Int32)objectInfo.meshes.size();
-			}
-
-
-			if (totalMeshCount !=
-				(Int32)meshObjects.size())
-			{
-				GePrint(
-					String(
-						"[OBJ.BIN UV BUILDER] Mesh count mismatch."
-					)
-				);
-
-				GePrint(
-					String("Analysis Mesh Count : ") +
-					Int32String(totalMeshCount)
-				);
-
-				GePrint(
-					String("C4D Mesh Count : ") +
-					Int32String(
-					(Int32)meshObjects.size()
-					)
-				);
-
-				return false;
-			}
-
-
-			result.meshCount =
-				(Int32)meshObjects.size();
-
-
-			// --------------------------------------------------------
-			// Flatten Object -> Mesh
-			//
-			// PolygonBuilder と同じ Mesh 順序を使用する。
-			// --------------------------------------------------------
-
-			Int32 meshIndex = 0;
-
-
-			for (size_t objectIndex = 0;
-				objectIndex < analysis.objects.size();
-				++objectIndex)
-			{
-				const ObjectInfo& objectInfo =
-					analysis.objects[objectIndex];
-
-
-				for (size_t localMeshIndex = 0;
-					localMeshIndex < objectInfo.meshes.size();
-					++localMeshIndex)
+				if ((count % 3) != 0)
 				{
-					const MeshInfo& mesh =
-						objectInfo.meshes[localMeshIndex];
+					GePrint(
+						"OBJ.BIN UV BUILDER : "
+						"Triangle index count is invalid\n"
+					);
+
+					return false;
+				}
 
 
-					// ------------------------------------------------
-					// Mesh object index validation
-					// ------------------------------------------------
-
-					if (meshIndex < 0 ||
-						meshIndex >=
-						(Int32)meshObjects.size())
-					{
-						PrintFailure(
-							String(
-								"Mesh object index out of range."
-							)
-						);
-
-						return false;
-					}
+				totalIndexCount +=
+					(UInt64)count;
+			}
 
 
-					PolygonObject* polygonObject =
-						meshObjects[
-							(Int32)meshIndex
+			const UInt64 polygonCount64 =
+				totalIndexCount / 3ULL;
+
+
+			if (polygonCount64 >
+				(UInt64)0x7FFFFFFF)
+			{
+				return false;
+			}
+
+
+			polygonCount =
+				(Int32)polygonCount64;
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Build UV for one mesh
+		// ============================================================
+
+		static Bool BuildOneMeshUV(
+			const MeshInfo& mesh,
+			PolygonObject* object,
+			Int32& uvVertexCount,
+			Int32& uvPolygonCount,
+			Int32& invalidUvCount)
+		{
+			uvVertexCount =
+				0;
+
+			uvPolygonCount =
+				0;
+
+			invalidUvCount =
+				0;
+
+
+			if (!object)
+			{
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Native TexCoord0
+			// --------------------------------------------------------
+
+			if (mesh.texCoords0.empty())
+			{
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"Native TexCoord0 is empty\n"
+				);
+
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Vertex count validation
+			// --------------------------------------------------------
+
+			if (mesh.texCoords0.size() !=
+				(size_t)mesh.vertexCount)
+			{
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"TexCoord0 count != VertexCount\n"
+				);
+
+				GePrint(
+					"  VertexCount : " +
+					String::IntToString(
+					(Int64)mesh.vertexCount
+					) +
+					"\n"
+				);
+
+				GePrint(
+					"  TexCoord0Count : " +
+					String::IntToString(
+					(Int64)mesh.texCoords0.size()
+					) +
+					"\n"
+				);
+
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Polygon count
+			// --------------------------------------------------------
+
+			Int32 polygonCount =
+				0;
+
+
+			if (!GetPolygonCount(
+				mesh,
+				polygonCount
+			))
+			{
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// C4D polygon count
+			// --------------------------------------------------------
+
+			if (object->GetPolygonCount() !=
+				polygonCount)
+			{
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"Polygon count mismatch\n"
+				);
+
+				GePrint(
+					"  C4D Polygon Count : " +
+					String::IntToString(
+					(Int64)object->GetPolygonCount()
+					) +
+					"\n"
+				);
+
+				GePrint(
+					"  OBJ.BIN Polygon Count : " +
+					String::IntToString(
+					(Int64)polygonCount
+					) +
+					"\n"
+				);
+
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Existing UVWTag
+			// --------------------------------------------------------
+
+			RemoveExistingUVWTag(
+				object
+			);
+
+
+			// --------------------------------------------------------
+			// Allocate
+			// --------------------------------------------------------
+
+			UVWTag* uvwTag =
+				UVWTag::Alloc(
+					polygonCount
+				);
+
+
+			if (!uvwTag)
+			{
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"UVWTag allocation failed\n"
+				);
+
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Build
+			// --------------------------------------------------------
+
+			Int32 polygonIndex =
+				0;
+
+
+			for (size_t subMeshIndex = 0;
+				subMeshIndex < mesh.subMeshes.size();
+				++subMeshIndex)
+			{
+				const SubMeshInfo& subMesh =
+					mesh.subMeshes[
+						subMeshIndex
+					];
+
+
+				for (size_t i = 0;
+					i < subMesh.triangleIndices.size();
+					i += 3)
+				{
+					const UInt32 nativeA =
+						subMesh.triangleIndices[
+							i
 						];
 
 
-					if (!polygonObject)
-					{
-						++result.invalidMeshCount;
+					const UInt32 nativeB =
+						subMesh.triangleIndices[
+							i + 1
+						];
 
-						PrintFailure(
-							String(
-								"PolygonObject is NULL at mesh index "
-							) +
-							Int32String(meshIndex)
+
+					const UInt32 nativeC =
+						subMesh.triangleIndices[
+							i + 2
+						];
+
+
+					// ------------------------------------------------
+					// Index validation
+					// ------------------------------------------------
+
+					if (nativeA >=
+						(UInt32)mesh.vertexCount ||
+						nativeB >=
+						(UInt32)mesh.vertexCount ||
+						nativeC >=
+						(UInt32)mesh.vertexCount)
+					{
+						GePrint(
+							"OBJ.BIN UV BUILDER : "
+							"Triangle vertex index out of range\n"
+						);
+
+						UVWTag::Free(
+							uvwTag
 						);
 
 						return false;
@@ -314,50 +381,58 @@ namespace GPTDiva
 
 
 					// ------------------------------------------------
-					// Mesh information
+					// PolygonBuilder order:
+					//
+					// Native:
+					//   A B C
+					//
+					// C4D:
+					//   A C B B
 					// ------------------------------------------------
 
-					GePrint(
-						String("UV MESH[") +
-						Int32String(meshIndex) +
-						String("]")
-					);
+					const Vector&
+						nativeUvA =
+						mesh.texCoords0[
+							(size_t)nativeA
+						];
 
-					GePrint(
-						String("Object Name : ") +
-						mesh.name.c_str()
-					);
 
-					GePrint(
-						String("Vertex Count : ") +
-						Int32String(mesh.vertexCount)
-					);
+					const Vector&
+						nativeUvC =
+						mesh.texCoords0[
+							(size_t)nativeC
+						];
 
-					GePrint(
-						String("Native UV Count : ") +
-						Int32String(
-						(Int32)mesh.texCoords0.size()
-						)
-					);
 
-					GePrint(
-						String("C4D Polygon Count : ") +
-						Int32String(
-							polygonObject->GetPolygonCount()
-						)
-					);
+					const Vector&
+						nativeUvB =
+						mesh.texCoords0[
+							(size_t)nativeB
+						];
 
 
 					// ------------------------------------------------
-					// Vertex count
+					// UV validation
 					// ------------------------------------------------
 
-					if (mesh.vertexCount <= 0)
+					if (!IsValidNativeUv(
+						nativeUvA) ||
+						!IsValidNativeUv(
+							nativeUvB) ||
+						!IsValidNativeUv(
+							nativeUvC))
 					{
-						PrintFailure(
-							String(
-								"Mesh has invalid vertex count."
-							)
+						++invalidUvCount;
+
+
+						GePrint(
+							"OBJ.BIN UV BUILDER : "
+							"Invalid Native UV\n"
+						);
+
+
+						UVWTag::Free(
+							uvwTag
 						);
 
 						return false;
@@ -365,478 +440,78 @@ namespace GPTDiva
 
 
 					// ------------------------------------------------
-					// Native UV count
+					// Native UV is already C4D-compatible.
 					//
-					// MikuMikuLibrary Classic Mesh:
+					// No flip.
+					// No normalize.
+					// No scale.
+					// ------------------------------------------------
+
+					UVWStruct uvw;
+
+
+					uvw.a =
+						Vector(
+							nativeUvA.x,
+							nativeUvA.y,
+							0.0
+						);
+
+
+					uvw.b =
+						Vector(
+							nativeUvC.x,
+							nativeUvC.y,
+							0.0
+						);
+
+
+					uvw.c =
+						Vector(
+							nativeUvB.x,
+							nativeUvB.y,
+							0.0
+						);
+
+
+					uvw.d =
+						uvw.c;
+
+
+					// ------------------------------------------------
+					// C4D R19 UV setter
 					//
-					// TexCoords0 =
-					// reader.ReadVector2s(vertexCount)
-					// ------------------------------------------------
-
-					const Int32 nativeUvCount =
-						(Int32)mesh.texCoords0.size();
-
-
-					if (nativeUvCount !=
-						mesh.vertexCount)
-					{
-						GePrint(
-							String(
-								"[OBJ.BIN UV BUILDER] "
-								"Native UV count mismatch."
-							)
-						);
-
-						GePrint(
-							String("Expected : ") +
-							Int32String(mesh.vertexCount)
-						);
-
-						GePrint(
-							String("Actual : ") +
-							Int32String(nativeUvCount)
-						);
-
-						return false;
-					}
-
-
-					// ------------------------------------------------
-					// Validate Native UV values
-					// ------------------------------------------------
-
-					for (Int32 vertexIndex = 0;
-						vertexIndex < nativeUvCount;
-						++vertexIndex)
-					{
-						const Vector& uv =
-							mesh.texCoords0[
-								(Int32)vertexIndex
-							];
-
-
-						if (!IsValidUV(uv))
-						{
-							++result.invalidUVCount;
-
-							GePrint(
-								String(
-									"[OBJ.BIN UV BUILDER] "
-									"INVALID UV"
-								)
-							);
-
-							GePrint(
-								String("Mesh : ") +
-								Int32String(meshIndex)
-							);
-
-							GePrint(
-								String("Vertex : ") +
-								Int32String(vertexIndex)
-							);
-
-							GePrint(
-								String("U : ") +
-								String::FloatToString(uv.x)
-							);
-
-							GePrint(
-								String("V : ") +
-								String::FloatToString(uv.y)
-							);
-
-							return false;
-						}
-					}
-
-
-					// ------------------------------------------------
-					// Calculate expected polygon count
-					// ------------------------------------------------
-
-					Int32 expectedPolygonCount = 0;
-
-
-					for (size_t subMeshIndex = 0;
-						subMeshIndex < mesh.subMeshes.size();
-						++subMeshIndex)
-					{
-						const SubMeshInfo& subMesh =
-							mesh.subMeshes[subMeshIndex];
-
-
-						const Int32 triangleIndexCount =
-							(Int32)subMesh.triangleIndices.size();
-
-
-						if ((triangleIndexCount % 3) != 0)
-						{
-							PrintFailure(
-								String(
-									"Triangle index count "
-									"is not divisible by 3."
-								)
-							);
-
-							return false;
-						}
-
-
-						expectedPolygonCount +=
-							triangleIndexCount / 3;
-					}
-
-
-					const Int32 c4dPolygonCount =
-						polygonObject->GetPolygonCount();
-
-
-					if (expectedPolygonCount !=
-						c4dPolygonCount)
-					{
-						GePrint(
-							String(
-								"[OBJ.BIN UV BUILDER] "
-								"Polygon count mismatch."
-							)
-						);
-
-						GePrint(
-							String("Expected : ") +
-							Int32String(
-								expectedPolygonCount
-							)
-						);
-
-						GePrint(
-							String("C4D : ") +
-							Int32String(
-								c4dPolygonCount
-							)
-						);
-
-						return false;
-					}
-
-
-					// ------------------------------------------------
-					// Remove old UVWTag
+					// UvSet() は使用しない。
 					//
-					// C4D R19:
-					//
-					// KillTag(Int32 type, Int32 nr)
-					//
-					// 正:
-					//     KillTag(Tuvw)
-					//
-					// 誤:
-					//     KillTag(uvwTag)
+					// UVWTag::SetSlow() が
+					// UVWTagの正式な設定API。
 					// ------------------------------------------------
 
-					BaseTag* existingUvTag =
-						polygonObject->GetTag(Tuvw);
-
-
-					if (existingUvTag)
-					{
-						polygonObject->KillTag(Tuvw);
-
-						GePrint(
-							String("Existing UVWTag : REMOVED")
-						);
-					}
-
-
-					// ------------------------------------------------
-					// Allocate UVWTag
-					// ------------------------------------------------
-
-					UVWTag* uvwTag =
-						UVWTag::Alloc(
-							c4dPolygonCount
-						);
-
-
-					if (!uvwTag)
-					{
-						PrintFailure(
-							String(
-								"UVWTag allocation failed."
-							)
-						);
-
-						return false;
-					}
-
-
-					// ------------------------------------------------
-					// Get writable handle
-					// ------------------------------------------------
-
-					UVWHandle uvwHandle =
-						uvwTag->GetDataAddressW();
-
-
-					if (!uvwHandle)
-					{
-						PrintFailure(
-							String(
-								"UVWHandle is NULL."
-							)
-						);
-
-						UVWTag::Free(uvwTag);
-
-						return false;
-					}
-
-
-					// ------------------------------------------------
-					// Write UVW data
-					//
-					// Native triangle:
-					//     A B C
-					//
-					// C4D polygon:
-					//     A C B
-					//
-					// UVW:
-					//     A = UV[A]
-					//     B = UV[C]
-					//     C = UV[B]
-					//     D = UV[B]
-					// ------------------------------------------------
-
-					Int32 polygonIndex = 0;
-
-
-					for (size_t subMeshIndex = 0;
-						subMeshIndex < mesh.subMeshes.size();
-						++subMeshIndex)
-					{
-						const SubMeshInfo& subMesh =
-							mesh.subMeshes[subMeshIndex];
-
-
-						const std::vector<UInt32>& triangles =
-							subMesh.triangleIndices;
-
-
-						const Int32 triangleIndexCount =
-							(Int32)triangles.size();
-
-
-						for (Int32 triangleIndex = 0;
-							triangleIndex <
-							triangleIndexCount;
-							triangleIndex += 3)
-						{
-							const UInt32 indexA =
-								triangles[
-									triangleIndex + 0
-								];
-
-							const UInt32 indexB =
-								triangles[
-									triangleIndex + 1
-								];
-
-							const UInt32 indexC =
-								triangles[
-									triangleIndex + 2
-								];
-
-
-							// ----------------------------------------
-							// Native index validation
-							// ----------------------------------------
-
-							if (indexA >=
-								(UInt32)nativeUvCount ||
-								indexB >=
-								(UInt32)nativeUvCount ||
-								indexC >=
-								(UInt32)nativeUvCount)
-							{
-								PrintFailure(
-									String(
-										"Triangle vertex index "
-										"exceeds UV array."
-									)
-								);
-
-								UVWTag::Free(uvwTag);
-
-								return false;
-							}
-
-
-							const Vector& uvA =
-								mesh.texCoords0[
-									(Int32)indexA
-								];
-
-							const Vector& uvB =
-								mesh.texCoords0[
-									(Int32)indexB
-								];
-
-							const Vector& uvC =
-								mesh.texCoords0[
-									(Int32)indexC
-								];
-
-
-							// ----------------------------------------
-							// C4D UVW structure
-							// ----------------------------------------
-
-							UVWStruct uvw;
-
-
-							uvw.a =
-								Vector(
-									uvA.x,
-									uvA.y,
-									0.0
-								);
-
-
-							uvw.b =
-								Vector(
-									uvC.x,
-									uvC.y,
-									0.0
-								);
-
-
-							uvw.c =
-								Vector(
-									uvB.x,
-									uvB.y,
-									0.0
-								);
-
-
-							uvw.d =
-								uvw.c;
-
-
-							// ----------------------------------------
-							// C4D R19:
-							//
-							// UVWTag::Set() -> void
-							//
-							// 戻り値による判定は行わない。
-							// ----------------------------------------
-
-							UVWTag::Set(
-								uvwHandle,
-								polygonIndex,
-								uvw
-							);
-
-
-							++polygonIndex;
-						}
-					}
-
-
-					// ------------------------------------------------
-					// Polygon count verification
-					// ------------------------------------------------
-
-					if (polygonIndex !=
-						c4dPolygonCount)
-					{
-						PrintFailure(
-							String(
-								"Generated UV polygon "
-								"count mismatch."
-							)
-						);
-
-						UVWTag::Free(uvwTag);
-
-						return false;
-					}
-
-
-					// ------------------------------------------------
-					// Insert UVWTag
-					// ------------------------------------------------
-
-					polygonObject->InsertTag(
-						uvwTag
+					uvwTag->SetSlow(
+						polygonIndex,
+						uvw
 					);
 
 
-					// ------------------------------------------------
-					// Update
-					// ------------------------------------------------
-
-					polygonObject->Message(
-						MSG_UPDATE
-					);
-
-
-					// ------------------------------------------------
-					// Result counters
-					// ------------------------------------------------
-
-					result.vertexCount +=
-						mesh.vertexCount;
-
-					result.polygonCount +=
-						polygonIndex;
-
-
-					// ------------------------------------------------
-					// Mesh success log
-					// ------------------------------------------------
-
-					GePrint(
-						String("Native UV : SUCCESS")
-					);
-
-					GePrint(
-						String("UV Vertex Count : ") +
-						Int32String(
-							mesh.vertexCount
-						)
-					);
-
-					GePrint(
-						String("UV Polygon Count : ") +
-						Int32String(
-							polygonIndex
-						)
-					);
-
-					GePrint(
-						String("UVWTag : CREATED")
-					);
-
-					PrintSeparator();
-
-
-					++meshIndex;
+					++polygonIndex;
 				}
 			}
 
 
 			// --------------------------------------------------------
-			// Final mesh count
+			// Polygon count final validation
 			// --------------------------------------------------------
 
-			if (meshIndex !=
-				result.meshCount)
+			if (polygonIndex !=
+				polygonCount)
 			{
-				PrintFailure(
-					String(
-						"Final mesh count mismatch."
-					)
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"Final polygon count mismatch\n"
+				);
+
+				UVWTag::Free(
+					uvwTag
 				);
 
 				return false;
@@ -844,15 +519,49 @@ namespace GPTDiva
 
 
 			// --------------------------------------------------------
-			// Invalid UV
+			// Insert tag
 			// --------------------------------------------------------
 
-			if (result.invalidUVCount != 0)
+			object->InsertTag(
+				uvwTag
+			);
+
+
+			object->Message(
+				MSG_UPDATE
+			);
+
+
+			uvVertexCount =
+				(Int32)mesh.texCoords0.size();
+
+
+			uvPolygonCount =
+				polygonCount;
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Build all UVW tags
+		// ============================================================
+
+		Bool BuildUvTags(
+			const AnalysisResult& analysis,
+			const std::vector<PolygonObject*>& meshObjects,
+			UvBuildResult& result)
+		{
+			result =
+				UvBuildResult();
+
+
+			if (!analysis.success)
 			{
-				PrintFailure(
-					String(
-						"Invalid UV count is not zero."
-					)
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"AnalysisResult is invalid\n"
 				);
 
 				return false;
@@ -860,18 +569,137 @@ namespace GPTDiva
 
 
 			// --------------------------------------------------------
-			// Invalid Mesh
+			// Count meshes
 			// --------------------------------------------------------
 
-			if (result.invalidMeshCount != 0)
+			Int32 analysisMeshCount =
+				0;
+
+
+			for (size_t objectIndex = 0;
+				objectIndex < analysis.objects.size();
+				++objectIndex)
 			{
-				PrintFailure(
-					String(
-						"Invalid mesh count is not zero."
-					)
+				analysisMeshCount +=
+					(Int32)
+					analysis.objects[
+						objectIndex
+					].meshes.size();
+			}
+
+
+			result.meshCount =
+				analysisMeshCount;
+
+
+			if ((Int32)meshObjects.size() !=
+				analysisMeshCount)
+			{
+				GePrint(
+					"OBJ.BIN UV BUILDER : "
+					"PolygonObject count mismatch\n"
+				);
+
+				GePrint(
+					"  Analysis Mesh Count : " +
+					String::IntToString(
+					(Int64)analysisMeshCount
+					) +
+					"\n"
+				);
+
+				GePrint(
+					"  PolygonObject Count : " +
+					String::IntToString(
+					(Int64)meshObjects.size()
+					) +
+					"\n"
 				);
 
 				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Same object/mesh order
+			// --------------------------------------------------------
+
+			size_t meshObjectIndex =
+				0;
+
+
+			for (size_t objectIndex = 0;
+				objectIndex < analysis.objects.size();
+				++objectIndex)
+			{
+				const ObjectInfo& objectInfo =
+					analysis.objects[
+						objectIndex
+					];
+
+
+				for (size_t meshIndex = 0;
+					meshIndex < objectInfo.meshes.size();
+					++meshIndex)
+				{
+					const MeshInfo& mesh =
+						objectInfo.meshes[
+							meshIndex
+						];
+
+
+					PolygonObject* object =
+						meshObjects[
+							meshObjectIndex
+						];
+
+
+					Int32 uvVertexCount =
+						0;
+
+
+					Int32 uvPolygonCount =
+						0;
+
+
+					Int32 invalidUvCount =
+						0;
+
+
+					if (!BuildOneMeshUV(
+						mesh,
+						object,
+						uvVertexCount,
+						uvPolygonCount,
+						invalidUvCount
+					))
+					{
+						GePrint(
+							"OBJ.BIN UV BUILDER : "
+							"Mesh build failed\n"
+						);
+
+						return false;
+					}
+
+
+					result.uvMeshCount++;
+
+
+					result.uvVertexCount +=
+						uvVertexCount;
+
+
+					result.uvPolygonCount +=
+						uvPolygonCount;
+
+
+					result.invalidUvCount +=
+						invalidUvCount;
+
+
+					++meshObjectIndex;
+				}
 			}
 
 
@@ -879,85 +707,287 @@ namespace GPTDiva
 			// Success
 			// --------------------------------------------------------
 
-			result.success = true;
+			result.success =
+				true;
 
+
+			// --------------------------------------------------------
+			// Result
+			// --------------------------------------------------------
 
 			GePrint(
-				String(
-					"============================================================"
-				)
+				"============================================================\n"
 			);
 
 			GePrint(
-				String(
-					"OBJ.BIN NATIVE UV IMPORT : SUCCESS"
-				)
+				"OBJ.BIN UV BUILDER : SUCCESS\n"
 			);
 
 			GePrint(
-				String(
-					"============================================================"
-				)
+				"============================================================\n"
 			);
 
 			GePrint(
-				String("Mesh Count : ") +
-				Int32String(
-					result.meshCount
-				)
+				"Mesh Count : " +
+				String::IntToString(
+				(Int64)result.meshCount
+				) +
+				"\n"
 			);
 
 			GePrint(
-				String("UV Vertex Count : ") +
-				Int32String(
-					result.vertexCount
-				)
+				"UV Mesh Count : " +
+				String::IntToString(
+				(Int64)result.uvMeshCount
+				) +
+				"\n"
 			);
 
 			GePrint(
-				String("UV Polygon Count : ") +
-				Int32String(
-					result.polygonCount
-				)
+				"UV Vertex Count : " +
+				String::IntToString(
+				(Int64)result.uvVertexCount
+				) +
+				"\n"
 			);
 
 			GePrint(
-				String("Invalid UV Count : ") +
-				Int32String(
-					result.invalidUVCount
-				)
+				"UV Polygon Count : " +
+				String::IntToString(
+				(Int64)result.uvPolygonCount
+				) +
+				"\n"
 			);
 
 			GePrint(
-				String("Invalid Mesh Count : ") +
-				Int32String(
-					result.invalidMeshCount
-				)
+				"Invalid UV Count : " +
+				String::IntToString(
+				(Int64)result.invalidUvCount
+				) +
+				"\n"
 			);
 
 			GePrint(
-				String("UV Conversion : NONE")
-			);
-
-			GePrint(
-				String("V Flip : NONE")
-			);
-
-			GePrint(
-				String("UVWTag Count : ") +
-				Int32String(
-					result.meshCount
-				)
-			);
-
-			GePrint(
-				String(
-					"============================================================"
-				)
+				"============================================================\n"
 			);
 
 
 			return true;
 		}
+
+
+		// ============================================================
+		// Verify one UVW tag
+		// ============================================================
+
+		static Bool VerifyOneUV(
+			PolygonObject* object,
+			Int32& polygonCount,
+			Int32& validPolygonCount,
+			Int32& invalidUvCount)
+		{
+			polygonCount =
+				0;
+
+			validPolygonCount =
+				0;
+
+			invalidUvCount =
+				0;
+
+
+			if (!object)
+			{
+				return false;
+			}
+
+
+			polygonCount =
+				object->GetPolygonCount();
+
+
+			UVWTag* uvwTag =
+				static_cast<UVWTag*>(
+					object->GetTag(
+						Tuvw
+					)
+					);
+
+
+			if (!uvwTag)
+			{
+				GePrint(
+					"OBJ.BIN UV VERIFY : "
+					"UVWTag not found\n"
+				);
+
+				return false;
+			}
+
+
+			// --------------------------------------------------------
+			// Make sure the tag contains enough UVW elements.
+			// --------------------------------------------------------
+
+			if (uvwTag->GetDataCount() <
+				polygonCount)
+			{
+				GePrint(
+					"OBJ.BIN UV VERIFY : "
+					"UVWTag data count is smaller than polygon count\n"
+				);
+
+				return false;
+			}
+
+
+			for (Int32 i = 0;
+				i < polygonCount;
+				++i)
+			{
+				// ----------------------------------------------------
+				// C4D R19 UV getter
+				//
+				// UvGet() は使用しない。
+				//
+				// UVWTag::GetSlow() が
+				// UVWTagの正式な取得API。
+				// ----------------------------------------------------
+
+				const UVWStruct uvw =
+					uvwTag->GetSlow(
+						i
+					);
+
+
+				if (!IsValidNativeUv(
+					uvw.a) ||
+					!IsValidNativeUv(
+						uvw.b) ||
+					!IsValidNativeUv(
+						uvw.c) ||
+					!IsValidNativeUv(
+						uvw.d))
+				{
+					++invalidUvCount;
+
+					continue;
+				}
+
+
+				++validPolygonCount;
+			}
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Verify all UVW tags
+		// ============================================================
+
+		Bool VerifyUvTags(
+			const std::vector<PolygonObject*>& meshObjects,
+			UvVerifyResult& result)
+		{
+			result =
+				UvVerifyResult();
+
+
+			for (size_t i = 0;
+				i < meshObjects.size();
+				++i)
+			{
+				Int32 polygonCount =
+					0;
+
+
+				Int32 validPolygonCount =
+					0;
+
+
+				Int32 invalidUvCount =
+					0;
+
+
+				if (!VerifyOneUV(
+					meshObjects[i],
+					polygonCount,
+					validPolygonCount,
+					invalidUvCount
+				))
+				{
+					return false;
+				}
+
+
+				result.polygonCount +=
+					polygonCount;
+
+
+				result.validPolygonCount +=
+					validPolygonCount;
+
+
+				result.invalidUvCount +=
+					invalidUvCount;
+			}
+
+
+			result.success =
+				(result.invalidUvCount == 0);
+
+
+			GePrint(
+				"============================================================\n"
+			);
+
+			GePrint(
+				"OBJ.BIN UV VERIFY\n"
+			);
+
+			GePrint(
+				"============================================================\n"
+			);
+
+			GePrint(
+				"Polygon Count : " +
+				String::IntToString(
+				(Int64)result.polygonCount
+				) +
+				"\n"
+			);
+
+			GePrint(
+				"Valid Polygon Count : " +
+				String::IntToString(
+				(Int64)result.validPolygonCount
+				) +
+				"\n"
+			);
+
+			GePrint(
+				"Invalid UV Count : " +
+				String::IntToString(
+				(Int64)result.invalidUvCount
+				) +
+				"\n"
+			);
+
+			GePrint(
+				result.success
+				? "RESULT : VALID\n"
+				: "RESULT : INVALID\n"
+			);
+
+			GePrint(
+				"============================================================\n"
+			);
+
+
+			return result.success;
+		}
+
 	}
 }

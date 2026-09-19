@@ -2,183 +2,121 @@
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
-// 内容:
-//   FARC Entry の物理データを FarcFile 経由で読み込み、
-//   必要に応じて GZip 展開し、OBJ.BIN の場合は
-//   MikuMikuLibrary 準拠の ObjBinAnalyzer へ渡す。
+// 内容 :
+//   FARC Entryの読み込み、GZip展開、OBJ.BIN解析、
+//   Polygon / Normal / UV生成、Skin / Bone解析、
+//   BlendWeight / BlendIndices解析、
+//   SubMesh BoneIndices解析、
+//   SubMesh / Blend / Skin Bone Mapping実データ照合を行う。
 //
-//   解析後は以下の順序で C4D へ接続する。
-//
-//     FARC
-//       ↓
-//     Entry
-//       ↓
-//     Physical Data
-//       ↓
-//     GZip
-//       ↓
-//     ObjBinAnalyzer
-//       ↓
-//     ObjBinPolygonBuilder
-//       ↓
-//     ObjBinNormalBuilder
-//       ↓
-//     ObjBinNormalVerifier
-//       ↓
-//     ObjBinUvBuilder
-//       ↓
-//     ObjBinUvVerifier
-//       ↓
-//     C4D PolygonObject / NormalTag / UVWTag
-//
-// Stage:
-//   OBJ.BIN Native UV
-//     -> C4D UVWTag
-//     -> UVWTag Read-Back Verification
-//
-// 今回やらないこと:
-//   - Material
-//   - Texture
-//   - Skin
-//   - Bone
-//   - EX Data
-//   - TEX.BIN解析
-//   - UV値の補正
-//   - V反転
-//   - OBJ.BIN再解析
-//
-// 次段階:
-//   UV Read-Back Verification 成功
+// Stage :
+//   FARC
 //   ↓
-//   Material / Texture
+//   Entry
+//   ↓
+//   GZip
+//   ↓
+//   OBJ.BIN
+//   ↓
+//   ObjectSet
+//   ↓
+//   Object
+//   ↓
+//   Mesh
+//   ↓
+//   Polygon
+//   ↓
+//   Normal
+//   ↓
+//   UV
+//   ↓
+//   Skin / Bone
+//   ↓
+//   BlendWeight / BlendIndices
+//   ↓
+//   SubMesh BoneIndices
+//   ↓
+//   Bone Mapping Analysis
 //
+// 今回の重要修正 :
+//   ObjBin::AnalyzeBoneMapping() は現行宣言に合わせて
+//
+//       analysis
+//       skinResult
+//       decompressedData
+//       boneMappingResult
+//
+//   の4引数を受け取る。
+//
+//   直前の AnalyzeSkin() で取得した skinResult を
+//   Mapping Analyzerへそのまま渡す。
+//
+//   SkinをMapping Analyzer内で再解析しない。
+//
+// 今回やらないこと :
+//   C4D Joint生成
+//   CAWeightTag生成
+//   Skin Deformer生成
+//   Bone Matrix接続
+//   EX Data変更
+//   Material / Texture接続
+//
+// 次段階 :
+//   Bone Mapping Analysisの実測結果確認
+//   ↓
+//   SubMesh BoneIndices / BlendIndices / Skin Bone ID
+//   の対応関係確定
+//   ↓
+//   C4D Joint / Weight構築
+//
+// Build :
+//   GPT_DIVA_FARC_ENTRY_READER_BONE_MAPPING_STAGE21_20260920
+// ============================================================
 
 #include "FarcEntryReader.h"
 
-// ================================================================
-// OBJ.BIN関連。
-// 実際のプロジェクト構成は source\objects\ なので
-// objects/ を明示する。
-// ================================================================
+#include "compression/GZipCompression.h"
 
 #include "objects/ObjBinAnalyzer.h"
 #include "objects/ObjBinPolygonBuilder.h"
 #include "objects/ObjBinNormalBuilder.h"
-#include "objects/ObjBinNormalVerifier.h"
 #include "objects/ObjBinUvBuilder.h"
-#include "objects/ObjBinUvVerifier.h"
+#include "objects/ObjBinSkinAnalyzer.h"
+#include "objects/ObjBinBlendAnalyzer.h"
+#include "objects/ObjBinSubMeshBoneAnalyzer.h"
+#include "objects/ObjBinBoneMappingAnalyzer.h"
 
-#include <cstring>
 #include <algorithm>
+#include <cstring>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include <zlib.h>
 
 
-// ================================================================
-// Build Marker
-// ================================================================
-
-#define GPT_DIVA_FARC_ENTRY_READER_STAGE9_UV_READBACK_20260919
-
-
 namespace GPTDiva
 {
 
-	// ============================================================
-	// Local helper
-	//
-	// std::string の末尾を大文字小文字無視で比較する。
-	//
-	// C4D R19 String::Find() には依存しない。
-	// ============================================================
+	// ========================================================================
+	// Build Marker
+	// ========================================================================
 
-	static Bool EndsWithIgnoreCase(
-		const std::string& value,
-		const char* suffix
-	)
-	{
-		if (!suffix)
-			return false;
-
-		const size_t valueLength =
-			value.size();
-
-		const size_t suffixLength =
-			std::strlen(suffix);
-
-		if (valueLength < suffixLength)
-			return false;
-
-		const size_t start =
-			valueLength - suffixLength;
-
-		for (size_t i = 0;
-			i < suffixLength;
-			++i)
-		{
-			char a =
-				value[start + i];
-
-			char b =
-				suffix[i];
-
-			if (a >= 'A' && a <= 'Z')
-				a = (char)(a - 'A' + 'a');
-
-			if (b >= 'A' && b <= 'Z')
-				b = (char)(b - 'A' + 'a');
-
-			if (a != b)
-				return false;
-		}
-
-		return true;
-	}
+	static const char* const
+		FARC_ENTRY_READER_BUILD_MARKER =
+		"GPT_DIVA_FARC_ENTRY_READER_BONE_MAPPING_STAGE21_20260920";
 
 
-	// ============================================================
-	// Fail
-	// ============================================================
-
-	void FarcEntryReader::Fail(
-		const Char* message
-	) const
-	{
-		if (!message)
-		{
-			GePrint(
-				"[FarcEntryReader] ERROR\n"
-			);
-
-			return;
-		}
-
-		GePrint(
-			"[FarcEntryReader] ERROR : "
-		);
-
-		GePrint(
-			message
-		);
-
-		GePrint(
-			"\n"
-		);
-	}
-
-
-	// ============================================================
-	// PrintEntryInfo
-	// ============================================================
+	// ========================================================================
+	// Entry Information
+	// ========================================================================
 
 	void FarcEntryReader::PrintEntryInfo(
 		const FarcArchive::Entry& entry
 	) const
 	{
 		GePrint(
-			"------------------------------------------------------------\n"
+			"\n------------------------------------------------------------\n"
 		);
 
 		GePrint(
@@ -189,9 +127,8 @@ namespace GPTDiva
 			"------------------------------------------------------------\n"
 		);
 
-		GePrint(
-			"Name : "
-		);
+
+		GePrint("Name : ");
 
 		GePrint(
 			String(
@@ -199,55 +136,43 @@ namespace GPTDiva
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
-		GePrint(
-			"Offset : "
-		);
+
+		GePrint("Offset : ");
 
 		GePrint(
 			String::IntToString(
-			(Int32)entry.offset
+			(Int64)entry.offset
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
-		GePrint(
-			"Compressed Size : "
-		);
+
+		GePrint("Compressed Size : ");
 
 		GePrint(
 			String::IntToString(
-			(Int32)entry.compressedSize
+			(Int64)entry.compressedSize
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
-		GePrint(
-			"Uncompressed Size : "
-		);
+
+		GePrint("Uncompressed Size : ");
 
 		GePrint(
 			String::IntToString(
-			(Int32)entry.uncompressedSize
+			(Int64)entry.uncompressedSize
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
-		GePrint(
-			"Compressed : "
-		);
+
+		GePrint("Compressed : ");
 
 		GePrint(
 			entry.isCompressed
@@ -255,15 +180,16 @@ namespace GPTDiva
 			: "NO\n"
 		);
 
+
 		GePrint(
 			"------------------------------------------------------------\n"
 		);
 	}
 
 
-	// ============================================================
-	// DumpEntryHeader
-	// ============================================================
+	// ========================================================================
+	// Entry Header
+	// ========================================================================
 
 	void FarcEntryReader::DumpEntryHeader(
 		const FarcArchive::Entry& entry
@@ -275,72 +201,9 @@ namespace GPTDiva
 	}
 
 
-	// ============================================================
-	// PrintHex
-	// ============================================================
-
-	void FarcEntryReader::PrintHex(
-		const std::vector<UChar>& data,
-		UInt32 maxBytes
-	) const
-	{
-		const UInt32 dataSize =
-			(UInt32)data.size();
-
-		const UInt32 count =
-			(dataSize < maxBytes)
-			? dataSize
-			: maxBytes;
-
-
-		for (UInt32 i = 0;
-			i < count;
-			++i)
-		{
-			const Int32 value =
-				(Int32)data[
-					(size_t)i
-				];
-
-
-			String text =
-				String::IntToString(
-					value
-				);
-
-
-			if (text.GetLength() == 1)
-			{
-				text =
-					String("0") +
-					text;
-			}
-
-
-			GePrint(
-				text
-			);
-
-			GePrint(
-				(i + 1 == count)
-				? "\n"
-				: " "
-			);
-		}
-
-
-		if (count == 0)
-		{
-			GePrint(
-				"(empty)\n"
-			);
-		}
-	}
-
-
-	// ============================================================
-	// ReadRawBytes
-	// ============================================================
+	// ========================================================================
+	// Raw Read
+	// ========================================================================
 
 	Bool FarcEntryReader::ReadRawBytes(
 		FarcFile& file,
@@ -352,6 +215,10 @@ namespace GPTDiva
 		data.clear();
 
 
+		if (size == 0)
+			return true;
+
+
 		if (!file.IsOpen())
 		{
 			Fail(
@@ -361,21 +228,6 @@ namespace GPTDiva
 			return false;
 		}
 
-
-		if (size == 0)
-		{
-			Fail(
-				"FARC entry physical size is zero."
-			);
-
-			return false;
-		}
-
-
-		// --------------------------------------------------------
-		// FARC Entry offset is an absolute file offset.
-		// FarcFile::Seek() uses FILESEEK_START.
-		// --------------------------------------------------------
 
 		if (!file.Seek(
 			(Int64)offset
@@ -409,26 +261,13 @@ namespace GPTDiva
 		}
 
 
-		if (data.size() !=
-			(size_t)size)
-		{
-			data.clear();
-
-			Fail(
-				"Physical read size mismatch."
-			);
-
-			return false;
-		}
-
-
 		return true;
 	}
 
 
-	// ============================================================
-	// VerifyGZipHeader
-	// ============================================================
+	// ========================================================================
+	// GZip Header
+	// ========================================================================
 
 	Bool FarcEntryReader::VerifyGZipHeader(
 		const std::vector<UChar>& data
@@ -437,136 +276,16 @@ namespace GPTDiva
 		if (data.size() < 10)
 		{
 			Fail(
-				"Entry is too small to contain a GZip header."
+				"Entry is too small to contain GZip header."
 			);
 
 			return false;
 		}
 
 
-		const UChar id1 =
-			data[0];
-
-		const UChar id2 =
-			data[1];
-
-		const UChar cm =
-			data[2];
-
-		const UChar flg =
-			data[3];
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"FARC GZIP HEADER\n"
-		);
-
-		GePrint(
-			"------------------------------------------------------------\n"
-		);
-
-		GePrint(
-			"ID1 : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)id1
-			)
-		);
-
-		GePrint(
-			"\nID2 : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)id2
-			)
-		);
-
-		GePrint(
-			"\nCM : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)cm
-			)
-		);
-
-		GePrint(
-			"\nFLG : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)flg
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		if (id1 != 0x1f ||
-			id2 != 0x8b ||
-			cm != 8)
-		{
-			GePrint(
-				"FARC GZIP HEADER : INVALID\n"
-			);
-
-			GePrint(
-				"============================================================\n"
-			);
-
-			return false;
-		}
-
-
-		GePrint(
-			"FARC GZIP HEADER : VALID\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-
-		return true;
-	}
-
-
-	// ============================================================
-	// DecompressEntry
-	// ============================================================
-
-	Bool FarcEntryReader::DecompressEntry(
-		RawEntry& entry
-	) const
-	{
-		entry.decompressedData.clear();
-
-
-		if (entry.data.empty())
-		{
-			Fail(
-				"Cannot decompress an empty entry."
-			);
-
-			return false;
-		}
-
-
-		if (!VerifyGZipHeader(
-			entry.data
-		))
+		if (data[0] != 0x1F ||
+			data[1] != 0x8B ||
+			data[2] != 8)
 		{
 			Fail(
 				"GZip header verification failed."
@@ -576,50 +295,27 @@ namespace GPTDiva
 		}
 
 
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : GZIP DECOMPRESSION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"ENTRY NAME : "
-		);
-
-		GePrint(
-			String(
-				entry.name.c_str()
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
+		return true;
+	}
 
 
-		const UInt32 expectedSize =
-			entry.uncompressedSize;
+	// ========================================================================
+	// GZip Decompression
+	// ========================================================================
+
+	Bool FarcEntryReader::DecompressEntry(
+		RawEntry& entry
+	) const
+	{
+		entry.decompressedData.clear();
 
 
-		if (expectedSize == 0)
+		if (!VerifyGZipHeader(
+			entry.data
+		))
 		{
-			Fail(
-				"UncompressedSize is zero."
-			);
-
 			return false;
 		}
-
-
-		entry.decompressedData.resize(
-			(size_t)expectedSize
-		);
 
 
 		z_stream stream;
@@ -634,64 +330,146 @@ namespace GPTDiva
 		const int initResult =
 			inflateInit2(
 				&stream,
-				16 + MAX_WBITS
+				15 + 16
 			);
 
 
 		if (initResult != Z_OK)
 		{
 			Fail(
-				"inflateInit2(GZip) failed."
+				"inflateInit2() failed."
 			);
-
-			entry.decompressedData.clear();
 
 			return false;
 		}
 
 
-		stream.next_in =
-			(Bytef*)entry.data.data();
+		const UInt32 INPUT_CHUNK =
+			64 * 1024;
 
-		stream.avail_in =
-			(uInt)entry.data.size();
-
-		stream.next_out =
-			(Bytef*)entry.decompressedData.data();
-
-		stream.avail_out =
-			(uInt)entry.decompressedData.size();
+		const UInt32 OUTPUT_CHUNK =
+			64 * 1024;
 
 
-		int inflateResult =
-			Z_OK;
+		UInt32 inputPosition =
+			0;
 
 
-		while (inflateResult == Z_OK)
+		while (true)
 		{
-			inflateResult =
+			if (stream.avail_in == 0 &&
+				inputPosition < entry.data.size())
+			{
+				const UInt32 remaining =
+					(UInt32)(
+						entry.data.size() -
+						(size_t)inputPosition
+						);
+
+
+				const UInt32 chunk =
+					std::min(
+						remaining,
+						INPUT_CHUNK
+					);
+
+
+				stream.next_in =
+					(Bytef*)&entry.data[
+						inputPosition
+					];
+
+				stream.avail_in =
+					(uInt)chunk;
+
+
+				inputPosition +=
+					chunk;
+			}
+
+
+			UChar outputBuffer[
+				OUTPUT_CHUNK
+			];
+
+
+			stream.next_out =
+				outputBuffer;
+
+			stream.avail_out =
+				OUTPUT_CHUNK;
+
+
+			const int inflateResult =
 				inflate(
 					&stream,
-					Z_FINISH
+					Z_NO_FLUSH
 				);
 
-			if (inflateResult == Z_BUF_ERROR)
-			{
-				if (stream.avail_out == 0)
-				{
-					break;
-				}
 
-				if (stream.avail_in == 0)
-				{
-					break;
-				}
+			const UInt32 produced =
+				OUTPUT_CHUNK -
+				(UInt32)stream.avail_out;
+
+
+			if (produced > 0)
+			{
+				const size_t oldSize =
+					entry.decompressedData.size();
+
+
+				entry.decompressedData.resize(
+					oldSize +
+					(size_t)produced
+				);
+
+
+				std::memcpy(
+					&entry.decompressedData[
+						oldSize
+					],
+					outputBuffer,
+							produced
+							);
+			}
+
+
+			if (inflateResult == Z_STREAM_END)
+				break;
+
+
+			if (inflateResult != Z_OK)
+			{
+				inflateEnd(
+					&stream
+				);
+
+				entry.decompressedData.clear();
+
+				Fail(
+					"inflate() failed."
+				);
+
+				return false;
+			}
+
+
+			if (inputPosition >= entry.data.size() &&
+				stream.avail_in == 0)
+			{
+				inflateEnd(
+					&stream
+				);
+
+				entry.decompressedData.clear();
+
+				Fail(
+					"GZip stream ended before Z_STREAM_END."
+				);
+
+				return false;
 			}
 		}
-
-
-		const uLongf actualSize =
-			(uLongf)stream.total_out;
 
 
 		inflateEnd(
@@ -699,90 +477,114 @@ namespace GPTDiva
 		);
 
 
-		if (inflateResult != Z_STREAM_END)
-		{
-			Fail(
-				"GZip inflate did not reach Z_STREAM_END."
-			);
-
-			entry.decompressedData.clear();
-
-			return false;
-		}
-
-
-		entry.decompressedData.resize(
-			(size_t)actualSize
-		);
-
-
-		GePrint(
-			"GZIP DECOMPRESS : SUCCESS\n"
-		);
-
-		GePrint(
-			"Decompressed Size : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)entry.decompressedData.size()
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		if (entry.uncompressedSize != 0 &&
-			entry.decompressedData.size() !=
-			(size_t)entry.uncompressedSize)
-		{
-			GePrint(
-				"GZIP SIZE CHECK : FAILED\n"
-			);
-
-			GePrint(
-				"Expected : "
-			);
-
-			GePrint(
-				String::IntToString(
-				(Int32)entry.uncompressedSize
-				)
-			);
-
-			GePrint(
-				"\nActual : "
-			);
-
-			GePrint(
-				String::IntToString(
-				(Int32)entry.decompressedData.size()
-				)
-			);
-
-			GePrint(
-				"\n"
-			);
-
-			return false;
-		}
-
-
-		GePrint(
-			"GZIP SIZE CHECK : OK\n"
-		);
-
-
 		return true;
 	}
 
 
-	// ============================================================
+	// ========================================================================
+	// Fail
+	// ========================================================================
+
+	void FarcEntryReader::Fail(
+		const Char* message
+	) const
+	{
+		GePrint(
+			"[FarcEntryReader] ERROR : "
+		);
+
+
+		if (message)
+			GePrint(message);
+
+
+		GePrint("\n");
+	}
+
+
+	// ========================================================================
+	// Hex
+	// ========================================================================
+
+	void FarcEntryReader::PrintHex(
+		const std::vector<UChar>& data,
+		UInt32 maxBytes
+	) const
+	{
+		UInt32 count =
+			(UInt32)data.size();
+
+
+		if (count > maxBytes)
+			count = maxBytes;
+
+
+		for (
+			UInt32 base = 0;
+			base < count;
+			base += 16
+			)
+		{
+			Char buffer[128];
+
+
+			std::sprintf(
+				buffer,
+				"%08X : ",
+				(unsigned int)base
+			);
+
+
+			GePrint(
+				buffer
+			);
+
+
+			for (
+				UInt32 i = 0;
+				i < 16;
+				++i
+				)
+			{
+				const UInt32 p =
+					base + i;
+
+
+				if (p < count)
+				{
+					Char byteBuffer[16];
+
+
+					std::sprintf(
+						byteBuffer,
+						"%02X ",
+						(unsigned int)data[p]
+					);
+
+
+					GePrint(
+						byteBuffer
+					);
+				}
+				else
+				{
+					GePrint(
+						"   "
+					);
+				}
+			}
+
+
+			GePrint(
+				"\n"
+			);
+		}
+	}
+
+
+	// ========================================================================
 	// ReadEntry
-	// ============================================================
+	// ========================================================================
 
 	Bool FarcEntryReader::ReadEntry(
 		BaseDocument* doc,
@@ -791,62 +593,17 @@ namespace GPTDiva
 		RawEntry& result
 	) const
 	{
-		GePrint(
-			"############################################################\n"
-		);
-
-		GePrint(
-			"### GPTDiva FarcEntryReader::ReadEntry() ENTERED ###\n"
-		);
-
-		GePrint(
-			"### CURRENT BUILD : UV READ-BACK 20260919 ###\n"
-		);
-
-		GePrint(
-			"############################################################\n"
-		);
-
-
-		// --------------------------------------------------------
-		// Document
-		// --------------------------------------------------------
-
 		if (!doc)
-		{
-			Fail(
-				"BaseDocument is NULL."
-			);
-
 			return false;
-		}
 
-
-		// --------------------------------------------------------
-		// FARC file
-		// --------------------------------------------------------
 
 		if (!file.IsOpen())
-		{
-			Fail(
-				"FARC file is not open."
-			);
-
 			return false;
-		}
 
-
-		// --------------------------------------------------------
-		// Reset RawEntry
-		// --------------------------------------------------------
 
 		result =
 			RawEntry();
 
-
-		// --------------------------------------------------------
-		// Copy Entry metadata
-		// --------------------------------------------------------
 
 		result.name =
 			entry.name;
@@ -864,23 +621,35 @@ namespace GPTDiva
 			entry.isCompressed;
 
 
-		// --------------------------------------------------------
-		// Entry information
-		// --------------------------------------------------------
+		GePrint(
+			"\n"
+			"############################################################\n"
+			"### GPTDIVA FarcEntryReader::ReadEntry() ENTERED ###\n"
+			"############################################################\n"
+		);
+
+
+		GePrint(
+			"Build : "
+		);
+
+		GePrint(
+			FARC_ENTRY_READER_BUILD_MARKER
+		);
+
+		GePrint(
+			"\n"
+		);
+
 
 		PrintEntryInfo(
 			entry
 		);
 
 
-		// ========================================================
-		// Physical data
-		// ========================================================
-
-		GePrint(
-			"[FarcEntryReader] Reading physical entry bytes...\n"
-		);
-
+		// ====================================================================
+		// Physical Read
+		// ====================================================================
 
 		if (!ReadRawBytes(
 			file,
@@ -899,44 +668,19 @@ namespace GPTDiva
 
 		GePrint(
 			String::IntToString(
-			(Int32)result.data.size()
+			(Int64)result.data.size()
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
 
-		GePrint(
-			"[FarcEntryReader] Physical first 32 bytes:\n"
-		);
-
-		PrintHex(
-			result.data,
-			32
-		);
-
-
-		// ========================================================
-		// Logical data
-		// ========================================================
+		// ====================================================================
+		// Decompression
+		// ====================================================================
 
 		if (result.isCompressed)
 		{
-			GePrint(
-				"============================================================\n"
-			);
-
-			GePrint(
-				"FARC ENTRY -> GZIP DECOMPRESSION\n"
-			);
-
-			GePrint(
-				"============================================================\n"
-			);
-
-
 			if (!DecompressEntry(
 				result
 			))
@@ -946,10 +690,6 @@ namespace GPTDiva
 		}
 		else
 		{
-			GePrint(
-				"[FarcEntryReader] Entry is uncompressed.\n"
-			);
-
 			result.decompressedData =
 				result.data;
 		}
@@ -961,56 +701,31 @@ namespace GPTDiva
 
 		GePrint(
 			String::IntToString(
-			(Int32)result.decompressedData.size()
+			(Int64)result.decompressedData.size()
 			)
 		);
 
-		GePrint(
-			"\n"
-		);
+		GePrint("\n");
 
 
-		GePrint(
-			"[FarcEntryReader] Logical first 32 bytes:\n"
-		);
-
-		PrintHex(
-			result.decompressedData,
-			32
-		);
-
-
-		// ========================================================
-		// OBJ.BIN classification
-		// ========================================================
-
-		const Bool isObjectEntry =
-			EndsWithIgnoreCase(
-				entry.name,
-				".obj.bin"
-			) ||
-			EndsWithIgnoreCase(
-				entry.name,
-				"_obj.bin"
+		if (entry.uncompressedSize != 0 &&
+			result.decompressedData.size() !=
+			(size_t)entry.uncompressedSize)
+		{
+			GePrint(
+				"[FarcEntryReader] WARNING : "
+				"Logical size mismatch.\n"
 			);
+		}
 
 
-		GePrint(
-			"[OBJ ENTRY CHECK] RESULT : "
-		);
-
-		GePrint(
-			isObjectEntry
-			? "TRUE\n"
-			: "FALSE\n"
-		);
-
-
-		// ========================================================
+		// ====================================================================
 		// Non OBJ.BIN
-		// ========================================================
+		// ====================================================================
 
-		if (!isObjectEntry)
+		if (!GPTDiva::ObjBin::IsObjectEntry(
+			result.name
+		))
 		{
 			GePrint(
 				"[FarcEntryReader] Entry is not OBJ.BIN.\n"
@@ -1024,49 +739,11 @@ namespace GPTDiva
 		}
 
 
-		// ========================================================
-		// OBJ.BIN confirmed
-		// ========================================================
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : OBJ.BIN ENTRY CONFIRMED\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-
-		GePrint(
-			"OBJ.BIN Logical Size : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)result.decompressedData.size()
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		// ========================================================
-		// ObjBinAnalyzer
-		// ========================================================
+		// ====================================================================
+		// OBJ.BIN Analyze
+		// ====================================================================
 
 		GPTDiva::ObjBin::AnalysisResult analysis;
-
-
-		GePrint(
-			"Connecting decompressedData -> "
-			"ObjBin::Analyze()\n"
-		);
 
 
 		if (!GPTDiva::ObjBin::Analyze(
@@ -1075,63 +752,99 @@ namespace GPTDiva
 			analysis
 		))
 		{
-			Fail(
-				"ObjBinAnalyzer::Analyze() failed."
-			);
-
 			return false;
 		}
 
 
 		if (!analysis.success)
-		{
-			Fail(
-				"ObjBinAnalyzer returned AnalysisResult.success == FALSE."
-			);
-
 			return false;
+
+
+		// ====================================================================
+		// Analysis Statistics
+		// ====================================================================
+
+		Int32 analysisMeshCount =
+			0;
+
+		Int32 analysisPointCount =
+			0;
+
+		Int32 analysisTriangleCount =
+			0;
+
+
+		for (
+			size_t objectIndex = 0;
+			objectIndex < analysis.objects.size();
+			++objectIndex
+			)
+		{
+			const GPTDiva::ObjBin::ObjectInfo& objectInfo =
+				analysis.objects[
+					objectIndex
+				];
+
+
+			for (
+				size_t meshIndex = 0;
+				meshIndex < objectInfo.meshes.size();
+				++meshIndex
+				)
+			{
+				const GPTDiva::ObjBin::MeshInfo& mesh =
+					objectInfo.meshes[
+						meshIndex
+					];
+
+
+				++analysisMeshCount;
+
+
+				analysisPointCount +=
+					(Int32)mesh.vertexCount;
+
+
+				for (
+					size_t subMeshIndex = 0;
+					subMeshIndex < mesh.subMeshes.size();
+					++subMeshIndex
+					)
+				{
+					const GPTDiva::ObjBin::SubMeshInfo& subMesh =
+						mesh.subMeshes[
+							subMeshIndex
+						];
+
+
+					if (
+						(subMesh.triangleIndices.size() % 3)
+						!= 0
+						)
+					{
+						return false;
+					}
+
+
+					analysisTriangleCount +=
+						(Int32)(
+							subMesh.triangleIndices.size()
+							/
+							3
+							);
+				}
+			}
 		}
 
 
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : OBJ.BIN ANALYSIS SUCCESS\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-
-		// ========================================================
-		// Polygon Builder
-		// ========================================================
+		// ====================================================================
+		// Polygon Objects
+		// ====================================================================
 
 		std::vector<PolygonObject*> meshObjects;
 
 
 		GPTDiva::ObjBin::PolygonBuildResult polygonResult;
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : POLYGON BUILDER CONNECTION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Connecting AnalysisResult + BaseDocument -> "
-			"ObjBin::BuildPolygonObjects()\n"
-		);
 
 
 		if (!GPTDiva::ObjBin::BuildPolygonObjects(
@@ -1141,102 +854,47 @@ namespace GPTDiva
 			polygonResult
 		))
 		{
-			Fail(
-				"ObjBinPolygonBuilder failed."
-			);
-
 			return false;
 		}
 
 
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"POLYGON OBJECT BUILD SUCCESS\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Build Success : "
-		);
-
-		GePrint(
-			polygonResult.success
-			? "YES\n"
-			: "NO\n"
-		);
-
-		GePrint(
-			"C4D Mesh Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)polygonResult.meshCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"C4D Point Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)polygonResult.pointCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"C4D Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)polygonResult.polygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
+		if (!polygonResult.success)
+			return false;
 
 
-		// ========================================================
-		// Normal Builder
-		// ========================================================
+		if (meshObjects.size() !=
+			(size_t)polygonResult.meshCount)
+		{
+			return false;
+		}
+
+
+		if (polygonResult.meshCount !=
+			analysisMeshCount)
+		{
+			return false;
+		}
+
+
+		if (polygonResult.pointCount !=
+			analysisPointCount)
+		{
+			return false;
+		}
+
+
+		if (polygonResult.polygonCount !=
+			analysisTriangleCount)
+		{
+			return false;
+		}
+
+
+		// ====================================================================
+		// Normal
+		// ====================================================================
 
 		GPTDiva::ObjBin::NormalBuildResult normalResult;
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : NORMAL BUILDER CONNECTION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Connecting AnalysisResult + meshObjects -> "
-			"ObjBin::BuildNormalTags()\n"
-		);
 
 
 		if (!GPTDiva::ObjBin::BuildNormalTags(
@@ -1245,187 +903,19 @@ namespace GPTDiva
 			normalResult
 		))
 		{
-			Fail(
-				"ObjBinNormalBuilder failed."
-			);
-
 			return false;
 		}
 
 
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"NORMAL TAG BUILD SUCCESS\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Normal Build Success : "
-		);
-
-		GePrint(
-			normalResult.success
-			? "YES\n"
-			: "NO\n"
-		);
-
-		GePrint(
-			"Normal Mesh Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)normalResult.meshCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		// --------------------------------------------------------
-		// NormalBuildResult に存在しない
-		// vertexCount / polygonCount は使用しない。
-		// --------------------------------------------------------
-
-		Int64 totalNormalVertexCount =
-			0;
-
-		Int64 totalNormalPolygonCount =
-			0;
-
-
-		for (size_t i = 0;
-			i < meshObjects.size();
-			++i)
-		{
-			PolygonObject* object =
-				meshObjects[i];
-
-			if (!object)
-				continue;
-
-
-			totalNormalVertexCount +=
-				(Int64)object->GetPointCount();
-
-			totalNormalPolygonCount +=
-				(Int64)object->GetPolygonCount();
-		}
-
-
-		GePrint(
-			"Normal Vertex Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-				totalNormalVertexCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		GePrint(
-			"Normal Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-				totalNormalPolygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		// ========================================================
-		// Normal Read-Back Verification
-		// ========================================================
-
-		GPTDiva::ObjBin::NormalVerifyResult normalVerifyResult;
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : NORMAL TAG READ-BACK CONNECTION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Connecting meshObjects -> "
-			"ObjBin::VerifyNormalTags()\n"
-		);
-
-
-		if (!GPTDiva::ObjBin::VerifyNormalTags(
-			meshObjects,
-			normalVerifyResult
-		))
-		{
-			Fail(
-				"ObjBinNormalVerifier failed."
-			);
-
+		if (!normalResult.success)
 			return false;
-		}
 
 
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"OBJ.BIN -> C4D NORMAL READ-BACK "
-			"VERIFICATION SUCCESSFUL\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-
-		// ========================================================
-		// UV Builder
-		// ========================================================
+		// ====================================================================
+		// UV
+		// ====================================================================
 
 		GPTDiva::ObjBin::UvBuildResult uvResult;
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : UV BUILDER CONNECTION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Connecting AnalysisResult + meshObjects -> "
-			"ObjBin::BuildUvTags()\n"
-		);
 
 
 		if (!GPTDiva::ObjBin::BuildUvTags(
@@ -1434,443 +924,385 @@ namespace GPTDiva
 			uvResult
 		))
 		{
-			Fail(
-				"ObjBinUvBuilder failed."
-			);
-
 			return false;
 		}
 
 
 		if (!uvResult.success)
+			return false;
+
+
+		GPTDiva::ObjBin::UvVerifyResult uvVerifyResult;
+
+
+		if (!GPTDiva::ObjBin::VerifyUvTags(
+			meshObjects,
+			uvVerifyResult
+		))
 		{
-			Fail(
-				"ObjBinUvBuilder returned success == FALSE."
+			return false;
+		}
+
+
+		if (!uvVerifyResult.success)
+			return false;
+
+
+		// ====================================================================
+		// Skin / Bone Analysis
+		// ====================================================================
+
+		GePrint(
+			"============================================================\n"
+			"GPT DIVA FARC TOOL : SKIN / BONE CONNECTION\n"
+			"============================================================\n"
+		);
+
+
+		GPTDiva::ObjBin::SkinAnalysisResult skinResult;
+
+
+		if (!GPTDiva::ObjBin::AnalyzeSkin(
+			result.decompressedData,
+			analysis.objects,
+			(UInt32)analysis.objects.size(),
+			skinResult
+		))
+		{
+			GePrint(
+				"OBJ.BIN SKIN / BONE ANALYSIS : FAILED\n"
 			);
 
 			return false;
 		}
 
 
-		// --------------------------------------------------------
-		// UV result
-		// --------------------------------------------------------
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"UV TAG BUILD SUCCESS\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"UV Build Success : "
-		);
-
-		GePrint(
-			uvResult.success
-			? "YES\n"
-			: "NO\n"
-		);
-
-		GePrint(
-			"UV Mesh Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvResult.meshCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Vertex Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvResult.vertexCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvResult.polygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"Invalid UV Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvResult.invalidUVCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"Invalid Mesh Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvResult.invalidMeshCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-
-		GePrint(
-			"OBJ.BIN -> C4D UVWTag CONNECTION SUCCESSFUL\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-
-		// ========================================================
-		// UV Read-Back Verification
-		//
-		// ObjBinUvVerifier は現在、
-		//
-		//     PolygonObject*
-		//
-		// を1個ずつ受け取る仕様。
-		//
-		// したがって meshObjects 全体を直接渡さず、
-		// 各 PolygonObject を順番に検証する。
-		//
-		// OBJ.BIN の再解析は行わない。
-		// BuildUvTags() が生成した UVWTag のみを読む。
-		// ========================================================
-
-		GPTDiva::ObjBin::UvVerifyResult uvVerifyTotal;
-
-
-		uvVerifyTotal.success =
-			true;
-
-		uvVerifyTotal.meshCount =
-			0;
-
-		uvVerifyTotal.tagCount =
-			0;
-
-		uvVerifyTotal.polygonCount =
-			0;
-
-		uvVerifyTotal.uvPolygonCount =
-			0;
-
-		uvVerifyTotal.invalidUVCount =
-			0;
-
-		uvVerifyTotal.invalidPolygonCount =
-			0;
-
-		uvVerifyTotal.sampleCount =
-			0;
-
-		uvVerifyTotal.invalidSampleCount =
-			0;
-
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"GPT DIVA FARC TOOL : UV TAG READ-BACK CONNECTION\n"
-		);
-
-		GePrint(
-			"============================================================\n"
-		);
-
-		GePrint(
-			"Connecting PolygonObjects -> "
-			"ObjBin::VerifyUvTags()\n"
-		);
-
-
-		// --------------------------------------------------------
-		// 各Meshを個別に検証する。
-		// --------------------------------------------------------
-
-		for (size_t i = 0;
-			i < meshObjects.size();
-			++i)
+		if (!skinResult.success)
 		{
-			PolygonObject* object =
-				meshObjects[i];
-
-
-			if (!object)
-			{
-				uvVerifyTotal.success =
-					false;
-
-				continue;
-			}
-
-
-			GPTDiva::ObjBin::UvVerifyResult meshVerifyResult;
-
-
-			const Bool meshVerifySuccess =
-				GPTDiva::ObjBin::VerifyUvTags(
-					object,
-					meshVerifyResult
-				);
-
-
-			// ----------------------------------------------------
-			// 集計
-			// ----------------------------------------------------
-
-			uvVerifyTotal.meshCount +=
-				meshVerifyResult.meshCount;
-
-			uvVerifyTotal.tagCount +=
-				meshVerifyResult.tagCount;
-
-			uvVerifyTotal.polygonCount +=
-				meshVerifyResult.polygonCount;
-
-			uvVerifyTotal.uvPolygonCount +=
-				meshVerifyResult.uvPolygonCount;
-
-			uvVerifyTotal.invalidUVCount +=
-				meshVerifyResult.invalidUVCount;
-
-			uvVerifyTotal.invalidPolygonCount +=
-				meshVerifyResult.invalidPolygonCount;
-
-			uvVerifyTotal.sampleCount +=
-				meshVerifyResult.sampleCount;
-
-			uvVerifyTotal.invalidSampleCount +=
-				meshVerifyResult.invalidSampleCount;
-
-
-			if (!meshVerifySuccess ||
-				!meshVerifyResult.success)
-			{
-				uvVerifyTotal.success =
-					false;
-			}
-		}
-
-
-		// --------------------------------------------------------
-		// 最終結果
-		// --------------------------------------------------------
-
-		if (meshObjects.empty())
-		{
-			uvVerifyTotal.success =
-				false;
-		}
-
-
-		if (!uvVerifyTotal.success)
-		{
-			Fail(
-				"ObjBinUvVerifier failed."
+			GePrint(
+				"OBJ.BIN SKIN / BONE ANALYSIS : RESULT FAILED\n"
 			);
 
 			return false;
 		}
 
 
-		// ========================================================
-		// UV Read-Back result
-		// ========================================================
-
 		GePrint(
+			"============================================================\n"
+			"OBJ.BIN SKIN / BONE ANALYSIS : SUCCESS\n"
 			"============================================================\n"
 		);
 
+
 		GePrint(
-			"OBJ.BIN -> C4D UV READ-BACK "
-			"VERIFICATION SUCCESSFUL\n"
+			"Skin Object Count : "
 		);
+
+		GePrint(
+			String::IntToString(
+			(Int64)skinResult.skinObjectCount
+			)
+		);
+
+		GePrint("\n");
+
+
+		GePrint(
+			"Actual Skin Bone Count : "
+		);
+
+		GePrint(
+			String::IntToString(
+			(Int64)skinResult.totalBoneCount
+			)
+		);
+
+		GePrint("\n");
+
+
+		GePrint(
+			"EX Data Object Count : "
+		);
+
+		GePrint(
+			String::IntToString(
+			(Int64)skinResult.exDataObjectCount
+			)
+		);
+
+		GePrint("\n");
+
+
+		// ====================================================================
+		// BlendWeight / BlendIndices
+		// ====================================================================
 
 		GePrint(
 			"============================================================\n"
-		);
-
-		GePrint(
-			"UV Verify Success : "
-		);
-
-		GePrint(
-			uvVerifyTotal.success
-			? "YES\n"
-			: "NO\n"
-		);
-
-		GePrint(
-			"UV Verify Mesh Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.meshCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Tag Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.tagCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.polygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify UV Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.uvPolygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Invalid UV Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.invalidUVCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Invalid Polygon Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.invalidPolygonCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Sample Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.sampleCount
-			)
-		);
-
-		GePrint(
-			"\n"
-		);
-
-		GePrint(
-			"UV Verify Invalid Sample Count : "
-		);
-
-		GePrint(
-			String::IntToString(
-			(Int32)uvVerifyTotal.invalidSampleCount
-			)
-		);
-
-		GePrint(
-			"\n"
+			"GPT DIVA FARC TOOL : BLEND ANALYZER CONNECTION\n"
+			"============================================================\n"
 		);
 
 
-		// ========================================================
-		// OBJ.BIN complete
-		// ========================================================
+		GPTDiva::ObjBin::BlendAnalysisResult blendResult;
+
+
+		if (!GPTDiva::ObjBin::AnalyzeBlend(
+			result.name,
+			result.decompressedData,
+			analysis,
+			blendResult
+		))
+		{
+			GePrint(
+				"OBJ.BIN BLEND ANALYSIS : FAILED\n"
+			);
+
+			return false;
+		}
+
+
+		if (!blendResult.success)
+		{
+			GePrint(
+				"OBJ.BIN BLEND ANALYSIS : RESULT FAILED\n"
+			);
+
+			return false;
+		}
+
 
 		GePrint(
-			"############################################################\n"
+			"OBJ.BIN BLEND ANALYSIS : SUCCESS\n"
+		);
+
+
+		GePrint(
+			"BlendWeight / BlendIndices : ANALYZED\n"
+		);
+
+
+		GePrint(
+			"CAWeightTag : NOT CREATED\n"
+		);
+
+
+		GePrint(
+			"Skin Deformer : NOT CREATED\n"
+		);
+
+
+		GePrint(
+			"Bone Matrix : NOT CONNECTED\n"
+		);
+
+
+		GePrint(
+			"BlendIndex -> Skin Bone : NOT CONNECTED\n"
+		);
+
+
+		// ====================================================================
+		// SubMesh BoneIndices
+		//
+		// MikuMikuLibrary SubMesh.cs:
+		//
+		//   BoneIndices = reader.ReadUInt16s(boneIndexCount)
+		//
+		//   only when:
+		//
+		//   BonesPerVertex == 4
+		//
+		// この段階ではNative Tableを確認する。
+		// ====================================================================
+
+		GePrint(
+			"============================================================\n"
+			"GPT DIVA FARC TOOL : SUBMESH BONE INDEX CONNECTION\n"
+			"============================================================\n"
+		);
+
+
+		GPTDiva::ObjBin::SubMeshBoneAnalysisResult
+			subMeshBoneResult;
+
+
+		if (!GPTDiva::ObjBin::AnalyzeSubMeshBoneIndices(
+			analysis,
+			subMeshBoneResult
+		))
+		{
+			GePrint(
+				"OBJ.BIN SUBMESH BONE INDEX ANALYSIS : FAILED\n"
+			);
+
+			return false;
+		}
+
+
+		if (!subMeshBoneResult.success)
+		{
+			GePrint(
+				"OBJ.BIN SUBMESH BONE INDEX ANALYSIS : RESULT FAILED\n"
+			);
+
+			return false;
+		}
+
+
+		GePrint(
+			"============================================================\n"
+			"OBJ.BIN SUBMESH BONE INDEX ANALYSIS : SUCCESS\n"
+			"============================================================\n"
+		);
+
+
+		GePrint(
+			"SubMesh BoneIndices : ANALYZED\n"
+		);
+
+
+		GePrint(
+			"Native Type : UInt16\n"
+		);
+
+
+		GePrint(
+			"Skin Bone Mapping : NOT CONNECTED\n"
+		);
+
+
+		GePrint(
+			"BlendIndex Mapping : NOT CONNECTED\n"
+		);
+
+
+		// ====================================================================
+		// Bone Mapping Analysis
+		//
+		// 現行 AnalyzeBoneMapping() の引数順:
+		//
+		//   1. AnalysisResult
+		//   2. SkinAnalysisResult
+		//   3. std::vector<UChar>
+		//   4. BoneMappingAnalysisResult
+		//
+		// AnalyzeSkin()で既に取得した skinResult を
+		// Mapping Analyzerへそのまま渡す。
+		//
+		// Mapping Analyzer内でSkinを再解析しない。
+		// ====================================================================
+
+		GePrint(
+			"============================================================\n"
+			"GPT DIVA FARC TOOL : BONE MAPPING ANALYZER CONNECTION\n"
+			"============================================================\n"
+		);
+
+
+		GPTDiva::ObjBin::BoneMappingAnalysisResult
+			boneMappingResult;
+
+
+		if (!GPTDiva::ObjBin::AnalyzeBoneMapping(
+			analysis,
+			skinResult,
+			result.decompressedData,
+			boneMappingResult
+		))
+		{
+			GePrint(
+				"OBJ.BIN BONE MAPPING ANALYSIS : FAILED\n"
+			);
+
+			return false;
+		}
+
+
+		if (!boneMappingResult.success)
+		{
+			GePrint(
+				"OBJ.BIN BONE MAPPING ANALYSIS : RESULT FAILED\n"
+			);
+
+			return false;
+		}
+
+
+		// ------------------------------------------------------------
+		// Result output
+		// ------------------------------------------------------------
+
+		GPTDiva::ObjBin::PrintBoneMappingAnalysisResult(
+			boneMappingResult
+		);
+
+
+		GePrint(
+			"============================================================\n"
+			"OBJ.BIN BONE MAPPING ANALYSIS : SUCCESS\n"
+			"============================================================\n"
+		);
+
+
+		GePrint(
+			"Skin Bone ID : ANALYZED\n"
 		);
 
 		GePrint(
-			"### FarcEntryReader::ReadEntry() COMPLETE ###\n"
+			"SubMesh BoneIndices : ANALYZED\n"
 		);
 
 		GePrint(
-			"### OBJ.BIN + Polygon + Normal + UV + UV VERIFY COMPLETE ###\n"
+			"BlendIndices : ANALYZED\n"
 		);
 
 		GePrint(
-			"############################################################\n"
+			"BlendWeights : ANALYZED\n"
+		);
+
+		GePrint(
+			"C4D Joint : NOT CREATED\n"
+		);
+
+		GePrint(
+			"CAWeightTag : NOT CREATED\n"
+		);
+
+		GePrint(
+			"Skin Deformer : NOT CREATED\n"
+		);
+
+		GePrint(
+			"Bone Matrix : NOT CONNECTED\n"
+		);
+
+		GePrint(
+			"Mapping Hypothesis : NOT ACCEPTED AUTOMATICALLY\n"
+		);
+
+
+		// ====================================================================
+		// Final Status
+		// ====================================================================
+
+		GePrint(
+			"============================================================\n"
+			"GPT DIVA FARC TOOL : OBJ.BIN IMPORT BUILD COMPLETE\n"
+			"============================================================\n"
+			"Polygon : SUCCESS\n"
+			"Normal  : SUCCESS\n"
+			"UV      : SUCCESS\n"
+			"Skin / Bone Analysis : SUCCESS\n"
+			"BlendWeight / BlendIndices : SUCCESS\n"
+			"SubMesh BoneIndices : SUCCESS\n"
+			"Bone Mapping Analysis : SUCCESS\n"
+			"Material : NOT CONNECTED\n"
+			"Texture  : NOT CONNECTED\n"
+			"C4D Joint : NOT CREATED\n"
+			"Skin Deformer : NOT CREATED\n"
+			"EX Block Body : NOT PARSED\n"
+			"============================================================\n"
 		);
 
 

@@ -1,14 +1,32 @@
+
 // File : ObjBinAnalyzer.cpp
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
 //   OBJ.BIN の ObjectSet / Texture ID Table / Object / Mesh /
-//   SubMesh Header / Index Payload / Triangle復元 / Position / Normal / UV
+//   SubMesh Header / SubMesh BoneIndices / Index Payload /
+//   Triangle復元 / Position / Normal / UV
 //   を解析する。
 //
 // Stage 19:
 //   MikuMikuLibrary Classic Mesh の TexCoord0 を解析する。
+//   追加:
+//   MikuMikuLibrary Classic SubMesh の BoneIndices を解析する。
+//
+// SubMesh BoneIndices:
+//
+//   MikuMikuLibrary SubMesh.cs:
+//     boneIndexCount   = Int32
+//     boneIndicesOffset = ReadOffset()
+//     BonesPerVertex   = UInt32
+//
+//   Classic:
+//     BonesPerVertex == 4 の場合だけ
+//     boneIndicesOffset から UInt16 配列を読む。
+//
+//   Native BoneIndices は UInt16 の値を UInt32 に格納する。
+//   Skin Bone ID への変換はこの段階では行わない。
 //
 // TexCoord0:
 //
@@ -32,14 +50,20 @@
 //   Texture 実体デコード
 //   Skin
 //   Bone
+//   BoneIndices -> Skin Bone ID
+//   BlendIndices -> Skin Bone
 //   EX Data
 //   PolygonObject生成
 //
 // 次段階:
-//   AnalysisResult
-//     -> PolygonObject
-//     -> NormalTag
-//     -> UVWTag
+//   SubMesh BoneIndices
+//     +
+//   Mesh BlendIndices
+//     +
+//   Skin Bone ID
+//     +
+//   Skin Bone Matrix
+//   の対応関係を実データで検証する。
 // ============================================================
 
 #include "ObjBinAnalyzer.h"
@@ -59,7 +83,7 @@ namespace GPTDiva
 
 		static const char* const
 			OBJBIN_ANALYZER_BUILD_MARKER =
-			"GPT_DIVA_FARC_OBJBIN_NATIVE_UV_STAGE19_20260919";
+			"GPT_DIVA_FARC_OBJBIN_SUBMESH_BONE_STAGE20_20260919";
 
 
 		// ============================================================
@@ -145,6 +169,11 @@ namespace GPTDiva
 		static const UInt32
 			MAX_TEXTURE_ID_COUNT =
 			1000000;
+
+
+		static const UInt32
+			MAX_BONE_INDEX_COUNT =
+			10000000;
 
 
 		// ============================================================
@@ -982,6 +1011,179 @@ namespace GPTDiva
 
 
 		// ============================================================
+		// Parse Classic SubMesh BoneIndices
+		//
+		// MikuMikuLibrary:
+		//
+		//   int boneIndexCount = reader.ReadInt32();
+		//   long boneIndicesOffset = reader.ReadOffset();
+		//   BonesPerVertex = reader.ReadUInt32();
+		//
+		//   reader.ReadAtOffsetIf(
+		//       BonesPerVertex == 4,
+		//       boneIndicesOffset,
+		//       () => {
+		//           BoneIndices =
+		//               reader.ReadUInt16s(
+		//                   boneIndexCount);
+		//       });
+		//
+		// Classic ObjectSetではOffsetはObject側の
+		// BaseOffsetを基準に扱われる。
+		//
+		// このC++実装では:
+		//
+		//   objectBase + boneIndicesOffset
+		//
+		// として読む。
+		//
+		// IMPORTANT:
+		//   ここでは値をSkin Bone IDへ変換しない。
+		//   UInt16 Native値をUInt32へ保持するだけ。
+		// ============================================================
+
+		static Bool ParseSubMeshBoneIndices(
+			const BinaryReaderLE& reader,
+			UInt32 objectBase,
+			SubMeshInfo& subMesh)
+		{
+			subMesh.boneIndices.clear();
+
+
+			// --------------------------------------------------------
+			// MikuMikuLibrary SubMesh.cs:
+			//
+			// BoneIndices are only read when
+			//
+			//     BonesPerVertex == 4
+			//
+			// --------------------------------------------------------
+
+			if (subMesh.bonesPerVertex != 4)
+			{
+				return true;
+			}
+
+
+			if (subMesh.boneIndexCount == 0)
+			{
+				return true;
+			}
+
+
+			if (subMesh.boneIndexCount >
+				MAX_BONE_INDEX_COUNT)
+			{
+				GePrint(
+					"OBJ.BIN ERROR : "
+					"SubMesh BoneIndexCount exceeds safety limit\n"
+				);
+
+
+				return false;
+			}
+
+
+			if (subMesh.boneIndicesOffset == 0)
+			{
+				GePrint(
+					"OBJ.BIN ERROR : "
+					"SubMesh BoneIndices exists but offset is zero\n"
+				);
+
+
+				return false;
+			}
+
+
+			UInt32 boneIndexBase =
+				0;
+
+
+			if (!AddOffset(
+				objectBase,
+				subMesh.boneIndicesOffset,
+				boneIndexBase))
+			{
+				return false;
+			}
+
+
+			const UInt64 required =
+				(UInt64)boneIndexBase +
+				(UInt64)subMesh.boneIndexCount *
+				2ULL;
+
+
+			if (required >
+				(UInt64)reader.Size())
+			{
+				GePrint(
+					"OBJ.BIN ERROR : "
+					"SubMesh BoneIndices range is outside OBJ.BIN\n"
+				);
+
+
+				return false;
+			}
+
+
+			try
+			{
+				subMesh.boneIndices.reserve(
+					(size_t)subMesh.boneIndexCount
+				);
+			}
+			catch (...)
+			{
+				return false;
+			}
+
+
+			for (UInt32 i = 0;
+				i < subMesh.boneIndexCount;
+				++i)
+			{
+				UInt32 currentOffset =
+					0;
+
+
+				if (!AddOffsetMul(
+					boneIndexBase,
+					0,
+					i,
+					2,
+					currentOffset))
+				{
+					return false;
+				}
+
+
+				UInt32 nativeBoneIndex =
+					0;
+
+
+				if (!reader.ReadUInt16(
+					currentOffset,
+					nativeBoneIndex))
+				{
+					return false;
+				}
+
+
+				subMesh.boneIndices.push_back(
+					nativeBoneIndex
+				);
+			}
+
+
+			return
+				subMesh.boneIndices.size() ==
+				(size_t)subMesh.boneIndexCount;
+		}
+
+
+		// ============================================================
 		// SubMeshes
 		// ============================================================
 
@@ -1028,7 +1230,8 @@ namespace GPTDiva
 				i < mesh.subMeshCount;
 				++i)
 			{
-				UInt32 subMeshBase = 0;
+				UInt32 subMeshBase =
+					0;
 
 
 				if (!AddOffsetMul(
@@ -1082,6 +1285,16 @@ namespace GPTDiva
 					return false;
 				}
 
+
+				// ----------------------------------------------------
+				// Offset +24 .. +31
+				//
+				// MikuMikuLibrary:
+				// TexCoordIndices = reader.ReadBytes(8)
+				//
+				// Current C++ analyzer does not yet expose these.
+				// Therefore these bytes are intentionally skipped.
+				// ----------------------------------------------------
 
 				if (!reader.ReadUInt32(
 					subMeshBase + 32,
@@ -1155,6 +1368,21 @@ namespace GPTDiva
 				}
 
 
+				// ----------------------------------------------------
+				// NEW:
+				//
+				// Native Classic SubMesh BoneIndices
+				// ----------------------------------------------------
+
+				if (!ParseSubMeshBoneIndices(
+					reader,
+					objectBase,
+					subMesh))
+				{
+					return false;
+				}
+
+
 				mesh.subMeshes.push_back(
 					subMesh
 				);
@@ -1185,7 +1413,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 elementSize = 0;
+			UInt32 elementSize =
+				0;
 
 
 			switch (subMesh.indexFormat)
@@ -1213,7 +1442,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 indexBase = 0;
+			UInt32 indexBase =
+				0;
 
 
 			if (!AddOffset(
@@ -1254,7 +1484,8 @@ namespace GPTDiva
 				i < subMesh.indexCount;
 				++i)
 			{
-				UInt32 currentOffset = 0;
+				UInt32 currentOffset =
+					0;
 
 
 				if (!AddOffsetMul(
@@ -1268,14 +1499,16 @@ namespace GPTDiva
 				}
 
 
-				UInt32 value = 0;
+				UInt32 value =
+					0;
 
 
 				switch (subMesh.indexFormat)
 				{
 				case 0:
 				{
-					UChar index = 0;
+					UChar index =
+						0;
 
 
 					if (!reader.ReadUInt8(
@@ -1403,7 +1636,8 @@ namespace GPTDiva
 				}
 
 
-				size_t position = 0;
+				size_t position =
+					0;
 
 
 				if (indices.size() < 2)
@@ -1420,7 +1654,8 @@ namespace GPTDiva
 					indices[position++];
 
 
-				Bool direction = false;
+				Bool direction =
+					false;
 
 
 				while (position <
@@ -1479,8 +1714,11 @@ namespace GPTDiva
 					}
 
 
-					a = b;
-					b = c;
+					a =
+						b;
+
+					b =
+						c;
 				}
 
 
@@ -1535,7 +1773,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 positionBase = 0;
+			UInt32 positionBase =
+				0;
 
 
 			if (!AddOffset(
@@ -1581,9 +1820,14 @@ namespace GPTDiva
 					i * 12U;
 
 
-				Float32 x = 0.0f;
-				Float32 y = 0.0f;
-				Float32 z = 0.0f;
+				Float32 x =
+					0.0f;
+
+				Float32 y =
+					0.0f;
+
+				Float32 z =
+					0.0f;
 
 
 				if (!reader.ReadFloat32(
@@ -1611,9 +1855,14 @@ namespace GPTDiva
 				Vector value;
 
 
-				value.x = (Float)x;
-				value.y = (Float)y;
-				value.z = (Float)z;
+				value.x =
+					(Float)x;
+
+				value.y =
+					(Float)y;
+
+				value.z =
+					(Float)z;
 
 
 				destinationMesh.positions.push_back(
@@ -1664,7 +1913,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 normalBase = 0;
+			UInt32 normalBase =
+				0;
 
 
 			if (!AddOffset(
@@ -1710,9 +1960,14 @@ namespace GPTDiva
 					i * 12U;
 
 
-				Float32 x = 0.0f;
-				Float32 y = 0.0f;
-				Float32 z = 0.0f;
+				Float32 x =
+					0.0f;
+
+				Float32 y =
+					0.0f;
+
+				Float32 z =
+					0.0f;
 
 
 				if (!reader.ReadFloat32(
@@ -1740,9 +1995,14 @@ namespace GPTDiva
 				Vector normal;
 
 
-				normal.x = (Float)x;
-				normal.y = (Float)y;
-				normal.z = (Float)z;
+				normal.x =
+					(Float)x;
+
+				normal.y =
+					(Float)y;
+
+				normal.z =
+					(Float)z;
 
 
 				destinationMesh.normals.push_back(
@@ -1759,21 +2019,6 @@ namespace GPTDiva
 
 		// ============================================================
 		// Parse Native TexCoord0
-		//
-		// MikuMikuLibrary:
-		//
-		// Classic Mesh:
-		//   TexCoord0 = bit 4
-		//   attributeOffsets[4]
-		//   ReadVector2s(vertexCount)
-		//
-		// Classic Vector2:
-		//   Float32 U
-		//   Float32 V
-		//
-		// 8 bytes / vertex
-		//
-		// Native UV is kept unchanged.
 		// ============================================================
 
 		static Bool ParseTexCoords0(
@@ -1832,7 +2077,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 uvBase = 0;
+			UInt32 uvBase =
+				0;
 
 
 			if (!AddOffset(
@@ -1843,14 +2089,6 @@ namespace GPTDiva
 				return false;
 			}
 
-
-			// --------------------------------------------------------
-			// Classic TexCoord0:
-			//
-			// Float32 U = 4 bytes
-			// Float32 V = 4 bytes
-			// Total      = 8 bytes / vertex
-			// --------------------------------------------------------
 
 			const UInt64 required =
 				(UInt64)uvBase +
@@ -1892,8 +2130,11 @@ namespace GPTDiva
 					i * 8U;
 
 
-				Float32 u = 0.0f;
-				Float32 v = 0.0f;
+				Float32 u =
+					0.0f;
+
+				Float32 v =
+					0.0f;
 
 
 				if (!reader.ReadFloat32(
@@ -1941,22 +2182,11 @@ namespace GPTDiva
 				Vector uv;
 
 
-				// ----------------------------------------------------
-				// IMPORTANT:
-				//
-				// Native U/V are preserved exactly.
-				//
-				// No V flip.
-				// No coordinate conversion.
-				// ----------------------------------------------------
-
 				uv.x =
 					(Float)u;
 
-
 				uv.y =
 					(Float)v;
-
 
 				uv.z =
 					0.0;
@@ -2039,7 +2269,8 @@ namespace GPTDiva
 				i < object.meshCount;
 				++i)
 			{
-				UInt32 meshBase = 0;
+				UInt32 meshBase =
+					0;
 
 
 				if (!AddOffsetMul(
@@ -2238,7 +2469,8 @@ namespace GPTDiva
 			}
 
 
-			UInt32 nameOffset = 0;
+			UInt32 nameOffset =
+				0;
 
 
 			if (!reader.ReadUInt32(
@@ -2290,7 +2522,8 @@ namespace GPTDiva
 			UInt32 objectIndex,
 			UInt32& id)
 		{
-			id = 0;
+			id =
+				0;
 
 
 			if (info.objectIDsOffset == 0)
@@ -2328,7 +2561,8 @@ namespace GPTDiva
 			UInt32 objectIndex,
 			UInt32& skinOffset)
 		{
-			skinOffset = 0;
+			skinOffset =
+				0;
 
 
 			if (info.objectSkinsOffset == 0)
@@ -2457,7 +2691,9 @@ namespace GPTDiva
 			}
 
 
-			BinaryReaderLE reader(data);
+			BinaryReaderLE reader(
+				data
+			);
 
 
 			// --------------------------------------------------------
@@ -2571,7 +2807,8 @@ namespace GPTDiva
 
 			if (result.objectSet.objectCount == 0)
 			{
-				result.success = true;
+				result.success =
+					true;
 
 
 				GePrint(
@@ -2628,7 +2865,8 @@ namespace GPTDiva
 				i < result.objectSet.objectCount;
 				++i)
 			{
-				UInt32 objectTableOffset = 0;
+				UInt32 objectTableOffset =
+					0;
 
 
 				if (!AddOffsetMul(
@@ -2642,7 +2880,8 @@ namespace GPTDiva
 				}
 
 
-				UInt32 objectOffset = 0;
+				UInt32 objectOffset =
+					0;
 
 
 				if (!reader.ReadUInt32(
@@ -2723,28 +2962,56 @@ namespace GPTDiva
 			// Validation
 			// --------------------------------------------------------
 
-			Bool allPositionsOK = true;
-			Bool allNormalsOK = true;
-			Bool allUVsOK = true;
-			Bool allIndicesOK = true;
-			Bool allTrianglesOK = true;
+			Bool allPositionsOK =
+				true;
+
+			Bool allNormalsOK =
+				true;
+
+			Bool allUVsOK =
+				true;
+
+			Bool allIndicesOK =
+				true;
+
+			Bool allTrianglesOK =
+				true;
 
 
-			UInt32 totalMeshCount = 0;
-			UInt32 totalIndexCount = 0;
-			UInt32 totalTriangleIndexCount = 0;
-			UInt32 totalTriangleCount = 0;
-			UInt32 totalStripSeparators = 0;
+			UInt32 totalMeshCount =
+				0;
+
+			UInt32 totalIndexCount =
+				0;
+
+			UInt32 totalTriangleIndexCount =
+				0;
+
+			UInt32 totalTriangleCount =
+				0;
+
+			UInt32 totalStripSeparators =
+				0;
 
 
-			UInt32 normalAttributeMeshCount = 0;
-			UInt32 normalMeshCount = 0;
-			UInt32 totalNormalCount = 0;
+			UInt32 normalAttributeMeshCount =
+				0;
+
+			UInt32 normalMeshCount =
+				0;
+
+			UInt32 totalNormalCount =
+				0;
 
 
-			UInt32 uvAttributeMeshCount = 0;
-			UInt32 uvMeshCount = 0;
-			UInt32 totalUVCount = 0;
+			UInt32 uvAttributeMeshCount =
+				0;
+
+			UInt32 uvMeshCount =
+				0;
+
+			UInt32 totalUVCount =
+				0;
 
 
 			for (size_t oi = 0;
@@ -2766,10 +3033,6 @@ namespace GPTDiva
 					++totalMeshCount;
 
 
-					// ------------------------------------------------
-					// Position
-					// ------------------------------------------------
-
 					if ((mesh.vertexFormat &
 						VERTEX_ATTRIBUTE_POSITION) != 0)
 					{
@@ -2781,10 +3044,6 @@ namespace GPTDiva
 						}
 					}
 
-
-					// ------------------------------------------------
-					// Normal
-					// ------------------------------------------------
 
 					if ((mesh.vertexFormat &
 						VERTEX_ATTRIBUTE_NORMAL) != 0)
@@ -2809,10 +3068,6 @@ namespace GPTDiva
 					}
 
 
-					// ------------------------------------------------
-					// TexCoord0
-					// ------------------------------------------------
-
 					if ((mesh.vertexFormat &
 						VERTEX_ATTRIBUTE_TEXCOORD0) != 0)
 					{
@@ -2835,10 +3090,6 @@ namespace GPTDiva
 							(UInt32)mesh.texCoords0.size();
 					}
 
-
-					// ------------------------------------------------
-					// SubMeshes
-					// ------------------------------------------------
 
 					for (size_t si = 0;
 						si < mesh.subMeshes.size();
@@ -2873,7 +3124,8 @@ namespace GPTDiva
 
 						totalTriangleCount +=
 							(UInt32)(
-								subMesh.triangleIndices.size() / 3
+								subMesh.triangleIndices.size() /
+								3
 								);
 
 
@@ -3063,10 +3315,6 @@ namespace GPTDiva
 			);
 
 
-			// --------------------------------------------------------
-			// UV
-			// --------------------------------------------------------
-
 			GePrint(
 				"UV Attribute Meshes : " +
 				UInt32ToString(
@@ -3146,6 +3394,11 @@ namespace GPTDiva
 
 
 			GePrint(
+				"SubMesh BoneIndices : PARSED\n"
+			);
+
+
+			GePrint(
 				"PolygonObject : NOT CREATED YET\n"
 			);
 
@@ -3172,3 +3425,4 @@ namespace GPTDiva
 
 	}
 }
+

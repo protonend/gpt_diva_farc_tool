@@ -1,89 +1,139 @@
-// File : ObjBinUvBuilder.h
+// File : ObjBinUVBuilder.h
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   ObjBinAnalyzer が解析した MikuMikuLibrary Native TexCoord0 を
-//   Cinema 4D R19 の UVWTag に接続する。
+//   ObjBinAnalyzer が解析済みの Native UV を
+//   Cinema 4D R19 の UVWTag へ接続する。
 // 
-//   対象:
-//     Classic Mesh
-//     VertexFormatAttributes.TexCoord0 = bit 4
-//     attributeOffsets[4]
-//     Float32 U + Float32 V
+//   OBJ.BIN の再解析は行わない。
+//   FARC / GZip / ObjectSet / Mesh / SubMesh の解析は
+//   ObjBinAnalyzer 側が担当する。
 //
-//   PolygonBuilder の三角形変換:
-//     Native : A, B, C
-//     C4D    : A, C, B
+// Native UV:
+//   U
+//   V
 //
-//   したがって UVWTag も PolygonBuilder と同じ順序で接続する。
+// C4D:
+//   UVWStruct
+//     a
+//     b
+//     c
+//     d
 //
-// Stage:
-//   OBJ.BIN Native UV -> C4D UVWTag
+// 現段階:
+//   Native U,V をそのまま使用する。
+//   U/V反転なし。
+//   0～1への正規化なし。
+//   スケール変更なし。
+//
+// Triangle:
+//   C4D PolygonBuilder と同じ順序を使用する。
 //
 // 今回やらないこと:
-//   - TexCoord1～3
-//   - Modern Storage
-//   - Material
-//   - Texture
-//   - Skin
-//   - Bone
-//   - EX Data
-//   - UVの再計算
-//   - UVのV反転
+//   Material
+//   Texture
+//   Skin
+//   Bone
+//   Morph
+//   EX Data
+//   UV再解析
 //
 // 次段階:
-//   UVWTag Read-Back Verification
-//   ↓
-//   Material / Texture
+//   Material / Texture 接続。
 //
+// ============================================================
 
-#ifndef GPT_DIVA_FARC_TOOL_OBJ_BIN_UV_BUILDER_H
-#define GPT_DIVA_FARC_TOOL_OBJ_BIN_UV_BUILDER_H
+#ifndef GPT_DIVA_FARC_TOOL_OBJ_BIN_UV_BUILDER_H__
+#define GPT_DIVA_FARC_TOOL_OBJ_BIN_UV_BUILDER_H__
 
 #include "c4d.h"
-
 #include "ObjBinAnalyzer.h"
 
 #include <vector>
+
 
 namespace GPTDiva
 {
 	namespace ObjBin
 	{
-		// ------------------------------------------------------------
+
+		// ============================================================
 		// UV Build Result
-		// ------------------------------------------------------------
+		// ============================================================
+
 		struct UvBuildResult
 		{
 			Bool success;
 
 			Int32 meshCount;
-			Int32 vertexCount;
-			Int32 polygonCount;
 
-			Int32 invalidUVCount;
-			Int32 invalidMeshCount;
+			Int32 uvMeshCount;
+
+			Int32 uvVertexCount;
+
+			Int32 uvPolygonCount;
+
+			Int32 invalidUvCount;
+
 
 			UvBuildResult()
-				: success(false),
-				meshCount(0),
-				vertexCount(0),
-				polygonCount(0),
-				invalidUVCount(0),
-				invalidMeshCount(0)
+				: success(false)
+				, meshCount(0)
+				, uvMeshCount(0)
+				, uvVertexCount(0)
+				, uvPolygonCount(0)
+				, invalidUvCount(0)
 			{
 			}
 		};
 
-		// ------------------------------------------------------------
-		// Native UV -> C4D UVWTag
-		// ------------------------------------------------------------
+
+		// ============================================================
+		// UV Verify Result
+		// ============================================================
+
+		struct UvVerifyResult
+		{
+			Bool success;
+
+			Int32 polygonCount;
+
+			Int32 validPolygonCount;
+
+			Int32 invalidUvCount;
+
+
+			UvVerifyResult()
+				: success(false)
+				, polygonCount(0)
+				, validPolygonCount(0)
+				, invalidUvCount(0)
+			{
+			}
+		};
+
+
+		// ============================================================
+		// Build UVW Tags
+		// ============================================================
+
 		Bool BuildUvTags(
 			const AnalysisResult& analysis,
 			const std::vector<PolygonObject*>& meshObjects,
 			UvBuildResult& result
 		);
+
+
+		// ============================================================
+		// Verify UVW Tags
+		// ============================================================
+
+		Bool VerifyUvTags(
+			const std::vector<PolygonObject*>& meshObjects,
+			UvVerifyResult& result
+		);
+
 	}
 }
 
