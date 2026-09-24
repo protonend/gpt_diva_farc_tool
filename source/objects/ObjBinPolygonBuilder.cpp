@@ -3,43 +3,42 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   ObjBinAnalyzer::AnalysisResult を Cinema 4D R19 の
-//   Null / PolygonObject 階層へ変換する。
+//   ObjBinAnalyzer の解析結果を C4D R19 PolygonObject へ変換する。
 //
-//   このファイルでは OBJ.BIN を再解析しない。
-//   BinaryReader、ObjectSet解析、Mesh解析、SubMesh解析等は
-//   ObjBinAnalyzer 側だけが担当する。
-//
-//   現段階では Polygon のみを生成する。
-//
-//   追加:
-//   実際に生成した PolygonObject* を meshObjects[] に保存する。
-//   保存順序は AnalysisResult.objects[].meshes[] と完全に同じ。
-//   NormalBuilder 等の後段処理がこの配列を使用する。
+//   今回は Geometry のみを検証する。
+//   Material / Texture / DDS は完全に切り離す。
 //
 // Stage:
-//   AnalysisResult
-//       -> Root Null
-//       -> Object Null
-//       -> Mesh PolygonObject
-//       -> Position
-//       -> Triangle Polygon
-//       -> meshObjects[]
+//   OBJ.BIN AnalysisResult
+//     -> Position
+//     -> triangleIndices
+//     -> C4D PolygonObject
+//
+// 今回の目的:
+//   「OBJ.BIN triangleIndices が壊れている」のか
+//   「C4D PolygonObject への投入で壊れている」のかを
+//   Geometry単独で確定する。
+//
+// 追加診断:
+//   SubMeshごとに
+//     - triangleIndices count
+//     - triangle count
+//     - min index
+//     - max index
+//     - out of range
+//     - degenerate triangle
+//     - 先頭12 triangle
 //
 // 今回やらないこと:
-//   NormalTag
-//   UV
 //   Material
 //   Texture
+//   DDS
+//   Alpha
+//   Normal
+//   UV
 //   Skin
 //   Bone
-//   Morph
-//   EX Data
-//   OBJ.BIN 再解析
-//
-// 次段階:
-//   meshObjects[] を NormalBuilder へ渡して
-//   Native Normal を C4D NormalTag へ接続する。
+//   TriangleStrip parser の変更
 // ============================================================
 
 #include "ObjBinPolygonBuilder.h"
@@ -47,30 +46,20 @@
 #include <string>
 #include <vector>
 
-
 namespace GPTDiva
 {
 	namespace ObjBin
 	{
 
-		// ============================================================
-		// Constants
-		// ============================================================
-
-		static const Float C4D_POSITION_SCALE = 100.0f;
+		static const Float
+			C4D_POSITION_SCALE = 100.0f;
 
 
-		// ============================================================
-		// std::string -> C4D String
-		// ============================================================
-
-		static String StdStringToC4DString(
+		static String ToC4DString(
 			const std::string& value)
 		{
 			if (value.empty())
-			{
 				return String();
-			}
 
 			return String(
 				value.c_str()
@@ -79,117 +68,398 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Mesh Polygon Count
+		// SubMesh Geometry Diagnostic
 		// ============================================================
 
-		static Bool GetMeshPolygonCount(
+		static Bool DiagnoseSubMesh(
 			const MeshInfo& mesh,
-			Int32& polygonCount)
+			Int32 meshIndex,
+			const SubMeshInfo& subMesh,
+			Int32 subMeshIndex)
 		{
-			polygonCount = 0;
+			const UInt32 pointCount =
+				(UInt32)mesh.positions.size();
 
-			UInt64 totalTriangleIndices = 0;
+			const size_t indexCount =
+				subMesh.triangleIndices.size();
 
-
-			for (size_t i = 0;
-				i < mesh.subMeshes.size();
-				++i)
-			{
-				const SubMeshInfo& subMesh =
-					mesh.subMeshes[i];
-
-
-				const size_t count =
-					subMesh.triangleIndices.size();
-
-
-				if ((count % 3) != 0)
-				{
-					GePrint(
-						"OBJ.BIN POLYGON BUILDER ERROR : "
-						"TriangleIndices count is not multiple of 3\n"
-					);
-
-					return false;
-				}
-
-
-				totalTriangleIndices +=
-					(UInt64)count;
-			}
-
-
-			const UInt64 triangleCount =
-				totalTriangleIndices / 3ULL;
-
-
-			if (triangleCount >
-				(UInt64)0x7FFFFFFF)
+			if ((indexCount % 3U) != 0U)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Polygon count exceeds Int32\n"
+					"[GEOMETRY DIAG] !!! INDEX COUNT NOT DIVISIBLE BY 3 !!!"
+				);
+
+				GePrint(
+					"[GEOMETRY DIAG] Mesh : " +
+					String::IntToString(
+					(Int64)meshIndex
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY DIAG] SubMesh : " +
+					String::IntToString(
+					(Int64)subMeshIndex
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY DIAG] Index Count : " +
+					String::IntToString(
+					(Int64)indexCount
+					)
 				);
 
 				return false;
 			}
 
+			const Int32 triangleCount =
+				(Int32)(indexCount / 3U);
 
-			polygonCount =
-				(Int32)triangleCount;
+			UInt32 minIndex =
+				0xFFFFFFFFU;
 
+			UInt32 maxIndex =
+				0U;
+
+			Int32 invalidCount =
+				0;
+
+			Int32 degenerateCount =
+				0;
+
+			for (size_t i = 0;
+				i < indexCount;
+				++i)
+			{
+				const UInt32 index =
+					subMesh.triangleIndices[i];
+
+				if (index < minIndex)
+					minIndex = index;
+
+				if (index > maxIndex)
+					maxIndex = index;
+
+				if (index >= pointCount)
+				{
+					++invalidCount;
+				}
+			}
+
+			for (size_t i = 0;
+				i < indexCount;
+				i += 3U)
+			{
+				const UInt32 a =
+					subMesh.triangleIndices[i + 0U];
+
+				const UInt32 b =
+					subMesh.triangleIndices[i + 1U];
+
+				const UInt32 c =
+					subMesh.triangleIndices[i + 2U];
+
+				if (a == b ||
+					b == c ||
+					c == a)
+				{
+					++degenerateCount;
+				}
+			}
+
+			GePrint(
+				"------------------------------------------------------------"
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] Mesh : " +
+				String::IntToString(
+				(Int64)meshIndex
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] SubMesh : " +
+				String::IntToString(
+				(Int64)subMeshIndex
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] Vertex Count : " +
+				String::IntToString(
+				(Int64)pointCount
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] Index Count : " +
+				String::IntToString(
+				(Int64)indexCount
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] Triangle Count : " +
+				String::IntToString(
+				(Int64)triangleCount
+				)
+			);
+
+			if (indexCount > 0U)
+			{
+				GePrint(
+					"[GEOMETRY DIAG] Min Index : " +
+					String::IntToString(
+					(Int64)minIndex
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY DIAG] Max Index : " +
+					String::IntToString(
+					(Int64)maxIndex
+					)
+				);
+			}
+			else
+			{
+				GePrint(
+					"[GEOMETRY DIAG] Min Index : NONE"
+				);
+
+				GePrint(
+					"[GEOMETRY DIAG] Max Index : NONE"
+				);
+			}
+
+			GePrint(
+				"[GEOMETRY DIAG] Invalid Index Count : " +
+				String::IntToString(
+				(Int64)invalidCount
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY DIAG] Degenerate Triangle Count : " +
+				String::IntToString(
+				(Int64)degenerateCount
+				)
+			);
+
+			// --------------------------------------------------------
+			// 先頭12 triangle
+			// --------------------------------------------------------
+
+			const size_t diagnosticTriangles =
+				triangleCount < 12 ?
+				(size_t)triangleCount :
+				(size_t)12;
+
+			for (size_t t = 0;
+				t < diagnosticTriangles;
+				++t)
+			{
+				const size_t base =
+					t * 3U;
+
+				const UInt32 a =
+					subMesh.triangleIndices[base + 0U];
+
+				const UInt32 b =
+					subMesh.triangleIndices[base + 1U];
+
+				const UInt32 c =
+					subMesh.triangleIndices[base + 2U];
+
+				GePrint(
+					"[GEOMETRY DIAG] TRI " +
+					String::IntToString(
+					(Int64)t
+					) +
+					" : " +
+					String::IntToString(
+					(Int64)a
+					) +
+					", " +
+					String::IntToString(
+					(Int64)b
+					) +
+					", " +
+					String::IntToString(
+					(Int64)c
+					)
+				);
+			}
+
+			if (invalidCount > 0)
+			{
+				GePrint(
+					"[GEOMETRY DIAG] STATUS : INVALID"
+				);
+
+				return false;
+			}
+
+			GePrint(
+				"[GEOMETRY DIAG] STATUS : VALID RANGE"
+			);
 
 			return true;
 		}
 
 
 		// ============================================================
-		// Create Mesh PolygonObject
+		// Polygon Count
 		// ============================================================
 
-		static PolygonObject* CreateMeshPolygonObject(
+		static Bool GetPolygonCount(
 			const MeshInfo& mesh,
-			Int32 polygonCount)
+			Int32& polygonCount)
 		{
-			// --------------------------------------------------------
-			// Point count
-			// --------------------------------------------------------
+			polygonCount = 0;
 
-			if (mesh.positions.size() >
-				(size_t)0x7FFFFFFF)
+			UInt64 totalIndices =
+				0ULL;
+
+			for (size_t si = 0;
+				si < mesh.subMeshes.size();
+				++si)
+			{
+				const SubMeshInfo& subMesh =
+					mesh.subMeshes[si];
+
+				if ((subMesh.triangleIndices.size() % 3U) != 0U)
+				{
+					GePrint(
+						"[GEOMETRY] triangleIndices count is not divisible by 3."
+					);
+
+					return false;
+				}
+
+				totalIndices +=
+					(UInt64)subMesh.triangleIndices.size();
+			}
+
+			const UInt64 triangleCount =
+				totalIndices / 3ULL;
+
+			if (triangleCount >
+				(UInt64)0x7FFFFFFFU)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Point count exceeds Int32\n"
+					"[GEOMETRY] Polygon count exceeds Int32."
+				);
+
+				return false;
+			}
+
+			polygonCount =
+				(Int32)triangleCount;
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Validate Mesh
+		// ============================================================
+
+		static Bool ValidateMeshGeometry(
+			const MeshInfo& mesh,
+			Int32 meshIndex)
+		{
+			const UInt32 pointCount =
+				(UInt32)mesh.positions.size();
+
+			if (mesh.vertexCount < 0)
+			{
+				GePrint(
+					"[GEOMETRY] Negative VertexCount."
+				);
+
+				return false;
+			}
+
+			if ((UInt32)mesh.vertexCount !=
+				pointCount)
+			{
+				GePrint(
+					"[GEOMETRY] Position count != VertexCount."
+				);
+
+				GePrint(
+					"[GEOMETRY] Mesh : " +
+					String::IntToString(
+					(Int64)meshIndex
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY] Position Count : " +
+					String::IntToString(
+					(Int64)pointCount
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY] VertexCount : " +
+					String::IntToString(
+					(Int64)mesh.vertexCount
+					)
+				);
+
+				return false;
+			}
+
+			for (size_t si = 0;
+				si < mesh.subMeshes.size();
+				++si)
+			{
+				const SubMeshInfo& subMesh =
+					mesh.subMeshes[si];
+
+				if (!DiagnoseSubMesh(
+					mesh,
+					meshIndex,
+					subMesh,
+					(Int32)si))
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Build Mesh PolygonObject
+		// ============================================================
+
+		static PolygonObject* BuildMeshObject(
+			const MeshInfo& mesh,
+			Int32 meshIndex,
+			Int32 polygonCount)
+		{
+			if (!ValidateMeshGeometry(
+				mesh,
+				meshIndex))
+			{
+				GePrint(
+					"[GEOMETRY] Mesh rejected before C4D allocation."
 				);
 
 				return nullptr;
 			}
-
 
 			const Int32 pointCount =
 				(Int32)mesh.positions.size();
 
-
-			// --------------------------------------------------------
-			// VertexCount / Position count
-			// --------------------------------------------------------
-
-			if ((UInt32)pointCount !=
-				mesh.vertexCount)
-			{
-				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Position count does not match VertexCount\n"
-				);
-
+			if (pointCount < 0)
 				return nullptr;
-			}
-
-
-			// --------------------------------------------------------
-			// Allocate
-			// --------------------------------------------------------
 
 			PolygonObject* object =
 				PolygonObject::Alloc(
@@ -197,51 +467,38 @@ namespace GPTDiva
 					polygonCount
 				);
 
-
 			if (!object)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"PolygonObject::Alloc failed\n"
+					"[GEOMETRY] PolygonObject::Alloc FAILED."
 				);
 
 				return nullptr;
 			}
 
-
-			// --------------------------------------------------------
-			// Name
-			// --------------------------------------------------------
-
-			if (!mesh.name.empty())
-			{
-				object->SetName(
-					StdStringToC4DString(
-						mesh.name
-					)
-				);
-			}
-			else
+			if (mesh.name.empty())
 			{
 				object->SetName(
 					String("Mesh")
 				);
 			}
-
-
-			// --------------------------------------------------------
-			// Points
-			// --------------------------------------------------------
+			else
+			{
+				object->SetName(
+					ToC4DString(
+						mesh.name
+					)
+				);
+			}
 
 			Vector* points =
 				object->GetPointW();
 
-
-			if (!points && pointCount > 0)
+			if (!points &&
+				pointCount > 0)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"GetPointW failed\n"
+					"[GEOMETRY] GetPointW FAILED."
 				);
 
 				PolygonObject::Free(
@@ -251,24 +508,12 @@ namespace GPTDiva
 				return nullptr;
 			}
 
-
-			// --------------------------------------------------------
-			// Native Position -> C4D
-			//
-			// X = X * 100
-			// Y = Y * 100
-			// Z = Z * -100
-			// --------------------------------------------------------
-
 			for (Int32 i = 0;
 				i < pointCount;
 				++i)
 			{
 				const Vector& source =
-					mesh.positions[
-						(size_t)i
-					];
-
+					mesh.positions[(size_t)i];
 
 				points[i] =
 					Vector(
@@ -283,20 +528,14 @@ namespace GPTDiva
 					);
 			}
 
-
-			// --------------------------------------------------------
-			// Polygons
-			// --------------------------------------------------------
-
 			CPolygon* polygons =
 				object->GetPolygonW();
 
-
-			if (!polygons && polygonCount > 0)
+			if (!polygons &&
+				polygonCount > 0)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"GetPolygonW failed\n"
+					"[GEOMETRY] GetPolygonW FAILED."
 				);
 
 				PolygonObject::Free(
@@ -306,64 +545,24 @@ namespace GPTDiva
 				return nullptr;
 			}
 
+			Int32 polygonIndex =
+				0;
 
-			Int32 polygonIndex = 0;
-
-
-			// --------------------------------------------------------
-			// SubMesh -> Polygon
-			//
-			// 1 Mesh = 1 PolygonObject
-			// 複数SubMeshも1つへ統合する。
-			// --------------------------------------------------------
-
-			for (size_t subMeshIndex = 0;
-				subMeshIndex < mesh.subMeshes.size();
-				++subMeshIndex)
+			for (size_t si = 0;
+				si < mesh.subMeshes.size();
+				++si)
 			{
 				const SubMeshInfo& subMesh =
-					mesh.subMeshes[
-						subMeshIndex
-					];
-
-
-				const size_t triangleIndexCount =
-					subMesh.triangleIndices.size();
-
+					mesh.subMeshes[si];
 
 				for (size_t i = 0;
-					i < triangleIndexCount;
-					i += 3)
+					i < subMesh.triangleIndices.size();
+					i += 3U)
 				{
-					const UInt32 a =
-						subMesh.triangleIndices[
-							i + 0
-						];
-
-
-					const UInt32 b =
-						subMesh.triangleIndices[
-							i + 1
-						];
-
-
-					const UInt32 c =
-						subMesh.triangleIndices[
-							i + 2
-						];
-
-
-					// ------------------------------------------------
-					// Vertex index range
-					// ------------------------------------------------
-
-					if (a >= mesh.vertexCount ||
-						b >= mesh.vertexCount ||
-						c >= mesh.vertexCount)
+					if (polygonIndex >= polygonCount)
 					{
 						GePrint(
-							"OBJ.BIN POLYGON BUILDER ERROR : "
-							"Triangle vertex index out of range\n"
+							"[GEOMETRY] Polygon index overflow."
 						);
 
 						PolygonObject::Free(
@@ -373,42 +572,91 @@ namespace GPTDiva
 						return nullptr;
 					}
 
+					const UInt32 a =
+						subMesh.triangleIndices[
+							i + 0U
+						];
 
-					// ------------------------------------------------
-					// Confirmed winding conversion
+					const UInt32 b =
+						subMesh.triangleIndices[
+							i + 1U
+						];
+
+					const UInt32 c =
+						subMesh.triangleIndices[
+							i + 2U
+						];
+
+					if (a >= (UInt32)pointCount ||
+						b >= (UInt32)pointCount ||
+						c >= (UInt32)pointCount)
+					{
+						GePrint(
+							"[GEOMETRY] Index out of point range."
+						);
+
+						PolygonObject::Free(
+							object
+						);
+
+						return nullptr;
+					}
+
+					// Native A,B,C
+					// ->
+					// C4D A,C,B
 					//
-					// Native:
-					//   A,B,C
-					//
-					// C4D:
-					//   A,C,B
-					// ------------------------------------------------
+					// Triangle is represented by c == d.
+
+					CPolygon polygon(
+						(Int32)a,
+						(Int32)c,
+						(Int32)b,
+						(Int32)b
+					);
+
+					if (polygon.c !=
+						polygon.d)
+					{
+						GePrint(
+							"[GEOMETRY] CPolygon is not a triangle."
+						);
+
+						PolygonObject::Free(
+							object
+						);
+
+						return nullptr;
+					}
 
 					polygons[
 						polygonIndex
 					] =
-						CPolygon(
-							(Int32)a,
-							(Int32)c,
-							(Int32)b,
-							(Int32)b
-						);
-
+						polygon;
 
 						++polygonIndex;
 				}
 			}
 
-
-			// --------------------------------------------------------
-			// Polygon count verification
-			// --------------------------------------------------------
-
-			if (polygonIndex != polygonCount)
+			if (polygonIndex !=
+				polygonCount)
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Polygon count mismatch\n"
+					"[GEOMETRY] Final polygon count mismatch."
+				);
+
+				GePrint(
+					"[GEOMETRY] Expected : " +
+					String::IntToString(
+					(Int64)polygonCount
+					)
+				);
+
+				GePrint(
+					"[GEOMETRY] Actual : " +
+					String::IntToString(
+					(Int64)polygonIndex
+					)
 				);
 
 				PolygonObject::Free(
@@ -418,61 +666,124 @@ namespace GPTDiva
 				return nullptr;
 			}
 
+			// --------------------------------------------------------
+			// 最終 Polygon 検査
+			// --------------------------------------------------------
 
-			// --------------------------------------------------------
-			// Update
-			// --------------------------------------------------------
+			for (Int32 i = 0;
+				i < polygonCount;
+				++i)
+			{
+				const CPolygon& polygon =
+					polygons[i];
+
+				if (polygon.a >= pointCount ||
+					polygon.b >= pointCount ||
+					polygon.c >= pointCount ||
+					polygon.d >= pointCount)
+				{
+					GePrint(
+						"[GEOMETRY] FINAL POLYGON INDEX INVALID."
+					);
+
+					PolygonObject::Free(
+						object
+					);
+
+					return nullptr;
+				}
+
+				if (polygon.c !=
+					polygon.d)
+				{
+					GePrint(
+						"[GEOMETRY] FINAL POLYGON IS NOT TRIANGLE."
+					);
+
+					PolygonObject::Free(
+						object
+					);
+
+					return nullptr;
+				}
+			}
 
 			object->Message(
 				MSG_UPDATE
 			);
 
+			GePrint(
+				"------------------------------------------------------------"
+			);
+
+			GePrint(
+				"[GEOMETRY] C4D PolygonObject CREATED"
+			);
+
+			GePrint(
+				"[GEOMETRY] Mesh : " +
+				String::IntToString(
+				(Int64)meshIndex
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY] Points : " +
+				String::IntToString(
+				(Int64)pointCount
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY] Polygons : " +
+				String::IntToString(
+				(Int64)polygonCount
+				)
+			);
+
+			GePrint(
+				"[GEOMETRY] STATUS : C4D GEOMETRY CREATED"
+			);
+
+			GePrint(
+				"------------------------------------------------------------"
+			);
 
 			return object;
 		}
 
 
 		// ============================================================
-		// Create Object Null
+		// Object Node
 		// ============================================================
 
-		static BaseObject* CreateObjectNull(
+		static BaseObject* CreateObjectNode(
 			const ObjectInfo& objectInfo)
 		{
-			BaseObject* objectNode =
+			BaseObject* node =
 				BaseObject::Alloc(
 					Onull
 				);
 
-
-			if (!objectNode)
-			{
-				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Object Null allocation failed\n"
-				);
-
+			if (!node)
 				return nullptr;
-			}
 
-
-			if (!objectInfo.name.empty())
+			if (objectInfo.name.empty())
 			{
-				objectNode->SetName(
-					StdStringToC4DString(
-						objectInfo.name
-					)
+				node->SetName(
+					String("Object")
 				);
 			}
 			else
 			{
-				objectNode->SetName(
-					String("Object")
+				node->SetName(
+					ToC4DString(
+						objectInfo.name
+					)
 				);
 			}
 
-
-			return objectNode;
+			return node;
 		}
 
 
@@ -483,97 +794,52 @@ namespace GPTDiva
 		Bool BuildPolygonObjects(
 			BaseDocument* doc,
 			const AnalysisResult& analysis,
-			std::vector<PolygonObject*>& meshObjects,
 			PolygonBuildResult& result)
 		{
-			// --------------------------------------------------------
-			// Initialize
-			// --------------------------------------------------------
-
 			result =
 				PolygonBuildResult();
 
-
-			meshObjects.clear();
-
-
-			// --------------------------------------------------------
-			// Document check
-			// --------------------------------------------------------
-
 			if (!doc)
-			{
-				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"BaseDocument is null\n"
-				);
-
 				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Analysis check
-			// --------------------------------------------------------
 
 			if (!analysis.success)
+				return false;
+
+			if (analysis.objects.empty())
 			{
 				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"AnalysisResult.success is FALSE\n"
+					"[GEOMETRY] Analysis has no objects."
 				);
 
 				return false;
 			}
-
-
-			// --------------------------------------------------------
-			// Root Null
-			// --------------------------------------------------------
 
 			BaseObject* rootNode =
 				BaseObject::Alloc(
 					Onull
 				);
 
-
 			if (!rootNode)
-			{
-				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"Root Null allocation failed\n"
-				);
-
 				return false;
-			}
 
-
-			// --------------------------------------------------------
-			// Root name
-			// --------------------------------------------------------
-
-			if (!analysis.name.empty())
-			{
-				rootNode->SetName(
-					StdStringToC4DString(
-						analysis.name
-					)
-				);
-			}
-			else
+			if (analysis.name.empty())
 			{
 				rootNode->SetName(
 					String("FARC_OBJ")
 				);
 			}
-
-
-			// ========================================================
-			// AnalysisResult.objects
-			// ========================================================
+			else
+			{
+				rootNode->SetName(
+					ToC4DString(
+						analysis.name
+					)
+				);
+			}
 
 			for (size_t objectIndex = 0;
-				objectIndex < analysis.objects.size();
+				objectIndex <
+				analysis.objects.size();
 				++objectIndex)
 			{
 				const ObjectInfo& objectInfo =
@@ -581,16 +847,10 @@ namespace GPTDiva
 						objectIndex
 					];
 
-
-				// ----------------------------------------------------
-				// Object Null
-				// ----------------------------------------------------
-
 				BaseObject* objectNode =
-					CreateObjectNull(
+					CreateObjectNode(
 						objectInfo
 					);
-
 
 				if (!objectNode)
 				{
@@ -598,26 +858,18 @@ namespace GPTDiva
 						rootNode
 					);
 
-					meshObjects.clear();
-
 					return false;
 				}
-
 
 				objectNode->InsertUnderLast(
 					rootNode
 				);
 
-
 				++result.objectCount;
 
-
-				// ----------------------------------------------------
-				// Meshes
-				// ----------------------------------------------------
-
 				for (size_t meshIndex = 0;
-					meshIndex < objectInfo.meshes.size();
+					meshIndex <
+					objectInfo.meshes.size();
 					++meshIndex)
 				{
 					const MeshInfo& mesh =
@@ -625,12 +877,10 @@ namespace GPTDiva
 							meshIndex
 						];
 
-
 					Int32 polygonCount =
 						0;
 
-
-					if (!GetMeshPolygonCount(
+					if (!GetPolygonCount(
 						mesh,
 						polygonCount))
 					{
@@ -638,148 +888,60 @@ namespace GPTDiva
 							rootNode
 						);
 
-						meshObjects.clear();
-
 						return false;
 					}
 
-
-					// ------------------------------------------------
-					// Create PolygonObject
-					// ------------------------------------------------
+					GePrint(
+						"[GEOMETRY] BUILD OBJECT : " +
+						String::IntToString(
+						(Int64)objectIndex
+						) +
+						" / MESH : " +
+						String::IntToString(
+						(Int64)meshIndex
+						)
+					);
 
 					PolygonObject* meshObject =
-						CreateMeshPolygonObject(
+						BuildMeshObject(
 							mesh,
+							(Int32)meshIndex,
 							polygonCount
 						);
 
-
 					if (!meshObject)
 					{
+						GePrint(
+							"[GEOMETRY] MESH BUILD FAILED."
+						);
+
 						BaseObject::Free(
 							rootNode
 						);
 
-						meshObjects.clear();
-
 						return false;
 					}
-
-
-					// ------------------------------------------------
-					// Insert under Object Null
-					// ------------------------------------------------
 
 					meshObject->InsertUnderLast(
 						objectNode
 					);
 
-
-					// ------------------------------------------------
-					// IMPORTANT:
-					//
-					// NormalBuilder等の後段Builder用に
-					// 実際のPolygonObjectを保存する。
-					//
-					// 順序:
-					//
-					// analysis.objects[]
-					//   -> ObjectInfo.meshes[]
-					//
-					// と完全に同じ。
-					// ------------------------------------------------
-
-					meshObjects.push_back(
-						meshObject
-					);
-
-
-					// ------------------------------------------------
-					// Statistics
-					// ------------------------------------------------
-
-					if (mesh.positions.size() >
-						(size_t)0x7FFFFFFF)
-					{
-						BaseObject::Free(
-							rootNode
-						);
-
-						meshObjects.clear();
-
-						return false;
-					}
-
-
-					const Int32 pointCount =
-						(Int32)mesh.positions.size();
-
-
-					if (result.pointCount >
-						0x7FFFFFFF - pointCount)
-					{
-						BaseObject::Free(
-							rootNode
-						);
-
-						meshObjects.clear();
-
-						return false;
-					}
-
-
-					if (result.polygonCount >
-						0x7FFFFFFF - polygonCount)
-					{
-						BaseObject::Free(
-							rootNode
-						);
-
-						meshObjects.clear();
-
-						return false;
-					}
-
-
 					++result.meshCount;
 
-
 					result.pointCount +=
-						pointCount;
-
+						(Int32)
+						mesh.positions.size();
 
 					result.polygonCount +=
 						polygonCount;
 				}
 			}
 
-
-			// --------------------------------------------------------
-			// Final mesh count verification
-			// --------------------------------------------------------
-
-			if (meshObjects.size() !=
-				(size_t)result.meshCount)
-			{
-				GePrint(
-					"OBJ.BIN POLYGON BUILDER ERROR : "
-					"meshObjects/result.meshCount mismatch\n"
-				);
-
-				BaseObject::Free(
-					rootNode
-				);
-
-				meshObjects.clear();
-
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Insert root into document
-			// --------------------------------------------------------
+			// ------------------------------------------------------------
+			// Geometry only
+			//
+			// Material Builder はここでは絶対に呼ばない。
+			// ------------------------------------------------------------
 
 			doc->InsertObject(
 				rootNode,
@@ -787,104 +949,59 @@ namespace GPTDiva
 				nullptr
 			);
 
-
-			// --------------------------------------------------------
-			// Success
-			// --------------------------------------------------------
-
 			result.success =
 				true;
 
-
-			// --------------------------------------------------------
-			// Log
-			// --------------------------------------------------------
-
 			GePrint(
-				"============================================================\n"
+				"============================================================"
 			);
 
 			GePrint(
-				"OBJ.BIN POLYGON BUILDER : SUCCESS\n"
+				"OBJ.BIN GEOMETRY BUILDER : SUCCESS"
 			);
 
 			GePrint(
-				"Object Count : "
-				+
+				"Object Count : " +
 				String::IntToString(
 				(Int64)result.objectCount
 				)
-				+
-				"\n"
 			);
 
 			GePrint(
-				"Mesh Count   : "
-				+
+				"Mesh Count : " +
 				String::IntToString(
 				(Int64)result.meshCount
 				)
-				+
-				"\n"
 			);
 
 			GePrint(
-				"Point Count  : "
-				+
+				"Point Count : " +
 				String::IntToString(
 				(Int64)result.pointCount
 				)
-				+
-				"\n"
 			);
 
 			GePrint(
-				"Polygon Count: "
-				+
+				"Polygon Count : " +
 				String::IntToString(
 				(Int64)result.polygonCount
 				)
-				+
-				"\n"
 			);
 
 			GePrint(
-				"Normal Polygons : 0\n"
+				"Material : DISABLED FOR GEOMETRY TEST"
 			);
 
 			GePrint(
-				"FBX UnitScale : 100\n"
+				"Texture : DISABLED FOR GEOMETRY TEST"
 			);
 
 			GePrint(
-				"FBX Axis : Y-Up / Z-Front / X-Right\n"
+				"============================================================"
 			);
-
-			GePrint(
-				"C4D Axis : Z FLIPPED\n"
-			);
-
-			GePrint(
-				"Triangle Winding : A,B,C -> A,C,B\n"
-			);
-
-			GePrint(
-				"Mesh Object Array : "
-				+
-				String::IntToString(
-				(Int64)meshObjects.size()
-				)
-				+
-				"\n"
-			);
-
-			GePrint(
-				"============================================================\n"
-			);
-
 
 			return true;
 		}
 
-	}
-}
+	} // namespace ObjBin
+} // namespace GPTDiva

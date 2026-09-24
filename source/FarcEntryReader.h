@@ -1,145 +1,96 @@
-
 // File : FarcEntryReader.h
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   FARC Entry の物理データ読み込み、GZip展開、論理データ保持、
-//   OBJ.BIN判定、ObjBinAnalyzerへの接続、および
-//   Polygon / Normal / UV / Skin / Bone / Blend Analyzerへの接続を定義する。
+//   FARC Entry の物理データを読み込み、GZip展開を行い、
+//   OBJ.BIN / TEX.BIN の解析へ接続する。
 //
-// 現在の処理経路:
+//   今回の追加:
+//     TextureSemanticResolver を FarcEntryReader に接続するための
+//     FARC単位キャッシュを追加する。
 //
-//   FARC
-//     ↓
-//   Entry
-//     ↓
-//   Physical Data
-//     ↓
-//   GZip
-//     ↓
-//   Logical Data
-//     ↓
-//   ObjBin::IsObjectEntry()
-//     ↓
-//   ObjBin::Analyze()
-//     ↓
-//   AnalysisResult
-//     ↓
-//   ObjBin::BuildPolygonObjects()
-//     ↓
-//   新規生成されたRoot以下のPolygonObject[]
-//     ↓
-//   ObjBin::BuildNormalTags()
-//     ↓
-//   ObjBin::BuildUvTags()
-//     ↓
-//   ObjBin::VerifyUvTags()
-//     ↓
-//   ObjBin::AnalyzeSkin()
-//     ↓
-//   Skin / Bone Analysis
-//     ↓
-//   ObjBin::AnalyzeBlend()
-//     ↓
-//   BlendWeight / BlendIndices Analysis
+//   MML準拠の対応:
+//     OBJ.BIN MaterialTexture.textureId
+//          -> tex_db.txi TextureDatabaseEntry.id
+//          -> TextureDatabase vector index
+//          -> TEX.BIN Texture vector index
+//          -> MaterialTexture.type
+//          -> COLOR / NORMAL / SPECULAR / ...
 //
-// 重要:
-//   - FARC解析仕様そのものは変更しない。
-//   - GZip処理は変更しない。
-//   - ObjBinAnalyzerで解析した結果を再解析しない。
-//   - Polygon Builder自体は変更しない。
-//   - Normal Builder自体は変更しない。
-//   - UV Builder自体は変更しない。
-//   - Skin Analyzer自体は変更しない。
-//   - Blend Analyzer自体は変更しない。
-//   - C4D R19 Filename / BaseFile経由のFARC読み込みを維持する。
-//   - std::printf() は使用しない。
-//   - ReadEntry()はScene Loaderから渡されたBaseDocumentを使用する。
-//   - GetActiveDocument()は使用しない。
-//   - Blend結果からC4D Joint / Weightをまだ生成しない。
+//   重要:
+//     TEX.BIN の Texture vector index と tex_db の vector index を
+//     対応させる条件は、MikuMikuLibrary の TextureSet 実装に合わせて
+//     TextureDatabase の件数と TEX.BIN Texture 件数が一致していること。
+//
+//   今回の重要変更:
+//     TEX.BIN は「Texture件数」だけではなく、
+//     TexBin::AnalysisResult 全体をキャッシュする。
+//
+//     これにより、OBJ / TextureDatabase / TEX の3情報が揃った時点で
+//     TextureSemanticResolver の結果を使って
+//     semantic-aware DDS exporter へ実データを渡せる。
 //
 // Stage:
 //   FARC
-//     ↓
-//   Entry
-//     ↓
-//   Physical Bytes
-//     ↓
-//   GZip
-//     ↓
-//   OBJ.BIN
-//     ↓
-//   ObjectSet
-//     ↓
-//   Object
-//     ↓
-//   Mesh
-//     ↓
-//   Polygon
-//     ↓
-//   Normal
-//     ↓
-//   UV
-//     ↓
-//   Skin / Bone Analysis
-//     ↓
-//   BlendWeight / BlendIndices Analysis
+//     -> Entry
+//     -> GZip
+//     -> OBJ.BIN
+//     -> TEX.BIN
+//     -> TextureDatabase
+//     -> TextureSemanticResolver
+//     -> semantic-aware DDS
 //
 // 今回やらないこと:
-//   Material
-//   Texture
-//   C4D Joint生成
-//   Bone Matrix
-//   Bind Matrix
-//   Weight生成
-//   CAWeightTag
-//   Skin Deformer
-//   EX Data Body
-//   Morph
-//   TriangleStrip再構成
+//   ・C4D Material への画像接続
+//   ・TextureTag 生成
+//   ・Texture Transform
+//   ・ATI2 Material Channel 接続
+//   ・BC7 / BC6H
+//   ・Bone
+//   ・Skin
+//   ・Weight
 //
 // 次段階:
-//   Blend結果の実データ検証
-//   ↓
-//   BlendIndexとSkin Bone配列の対応確認
-//   ↓
-//   C4D Joint接続
-// ============================================================================
+//   semantic-aware DDS の生成結果を確認した後、
+//   MaterialTexture と C4D Material の画像接続へ進む。
+// ============================================================
 
-#ifndef GPT_DIVA_FARC_TOOL_FARC_ENTRY_READER_H__
-#define GPT_DIVA_FARC_TOOL_FARC_ENTRY_READER_H__
+#ifndef GPT_DIVA_FARC_TOOL_FARC_ENTRY_READER_H
+#define GPT_DIVA_FARC_TOOL_FARC_ENTRY_READER_H
 
-#include "c4d.h"
 
-#include "FarcFile.h"
-#include "FarcArchive.h"
+#include <c4d.h>
 
 #include <vector>
 #include <string>
 
 
+#include "FarcFile.h"
+#include "FarcArchive.h"
+
+#include "objects/ObjBinAnalyzer.h"
+
+#include "textures/TextureDatabaseReader.h"
+#include "textures/TexBinAnalyzer.h"
+
+
 namespace GPTDiva
 {
 
-	// ========================================================================
+
+	// ============================================================
 	// RawEntry
-	// ========================================================================
+	//
+	// FARCから読み出した1 Entry の物理データと
+	// GZip展開後の論理データを保持する。
+	// ============================================================
 
 	struct RawEntry
 	{
-		// --------------------------------------------------------------------
-		// Entry name
-		// --------------------------------------------------------------------
-
 		std::string name;
 
-
-		// --------------------------------------------------------------------
-		// FARC entry metadata
-		// --------------------------------------------------------------------
-
-		UInt32 offset;
+		Int64 offset;
 
 		UInt32 compressedSize;
 
@@ -147,84 +98,46 @@ namespace GPTDiva
 
 		Bool isCompressed;
 
-
-		// --------------------------------------------------------------------
-		// FARC上の物理データ
-		// --------------------------------------------------------------------
-
 		std::vector<UChar> data;
-
-
-		// --------------------------------------------------------------------
-		// GZip展開後の論理データ
-		// --------------------------------------------------------------------
 
 		std::vector<UChar> decompressedData;
 
 
-		// --------------------------------------------------------------------
-		// Constructor
-		// --------------------------------------------------------------------
-
 		RawEntry()
-			: offset(0)
-			, compressedSize(0)
-			, uncompressedSize(0)
-			, isCompressed(false)
+			:
+			offset(0),
+			compressedSize(0),
+			uncompressedSize(0),
+			isCompressed(false)
 		{
 		}
 	};
 
 
-	// ========================================================================
+	// ============================================================
 	// FarcEntryReader
-	// ========================================================================
+	// ============================================================
 
 	class FarcEntryReader
 	{
 	public:
 
-		// --------------------------------------------------------------------
-		// FARC Entryを読み込む。
+		// --------------------------------------------------------
+		// Constructor / Destructor
+		// --------------------------------------------------------
+
+		FarcEntryReader();
+
+		~FarcEntryReader();
+
+
+		// --------------------------------------------------------
+		// ReadEntry
 		//
-		// 処理:
-		//
-		//   FARC Entry
-		//      ->
-		//   Physical Data
-		//      ->
-		//   GZip
-		//      ->
-		//   Logical Data
-		//      ->
-		//   ObjBin::Analyze()
-		//      ->
-		//   AnalysisResult
-		//      ->
-		//   ObjBin::BuildPolygonObjects()
-		//      ->
-		//   PolygonObject[]
-		//      ->
-		//   ObjBin::BuildNormalTags()
-		//      ->
-		//   ObjBin::BuildUvTags()
-		//      ->
-		//   ObjBin::VerifyUvTags()
-		//      ->
-		//   ObjBin::AnalyzeSkin()
-		//      ->
-		//   Skin / Bone Analysis
-		//      ->
-		//   ObjBin::AnalyzeBlend()
-		//      ->
-		//   BlendWeight / BlendIndices Analysis
-		//
-		// doc:
-		//   Scene Loaderから渡された明示的なBaseDocument。
-		//
-		// IMPORTANT:
-		//   GetActiveDocument()は使用しない。
-		// --------------------------------------------------------------------
+		// FARC Entry を読み込み、
+		// 必要に応じて GZip 展開し、
+		// OBJ.BIN / TEX.BIN の解析へ接続する。
+		// --------------------------------------------------------
 
 		Bool ReadEntry(
 			BaseDocument* doc,
@@ -234,9 +147,22 @@ namespace GPTDiva
 		) const;
 
 
-		// --------------------------------------------------------------------
-		// FARC Entry Header表示
-		// --------------------------------------------------------------------
+		// --------------------------------------------------------
+		// Raw Entry only
+		//
+		// 既存処理との互換用。
+		// --------------------------------------------------------
+
+		Bool ReadEntry(
+			FarcFile& file,
+			const FarcArchive::Entry& entry,
+			RawEntry& result
+		) const;
+
+
+		// --------------------------------------------------------
+		// Debug
+		// --------------------------------------------------------
 
 		void DumpEntryHeader(
 			const FarcArchive::Entry& entry
@@ -245,44 +171,153 @@ namespace GPTDiva
 
 	private:
 
-		// --------------------------------------------------------------------
-		// Physical Entry Read
-		// --------------------------------------------------------------------
+
+		// ========================================================
+		// FARC Cache
+		//
+		// ReadEntry() は const のまま維持する。
+		// C4D R19 側の既存呼び出し構造を変更しないため、
+		// 解析キャッシュだけ mutable とする。
+		// ========================================================
+
+		mutable Bool _cacheInitialized;
+
+		// 現在キャッシュしているFARCのFilename。
+		//
+		// FarcFile* を保存する方式ではなく、
+		// 実際のファイルパスを識別子として使用する。
+		mutable String _cachedArchivePath;
+
+
+		// ========================================================
+		// OBJ.BIN Analysis Cache
+		// ========================================================
+
+		mutable Bool _hasObjAnalysis;
+
+		mutable ObjBin::AnalysisResult _cachedObjAnalysis;
+
+
+		// ========================================================
+		// Texture Database Cache
+		//
+		// TextureDatabaseLocator が見つけて解析した
+		// tex_db.bin / tex_db.txi の結果を保持する。
+		// ========================================================
+
+		mutable Bool _hasTextureDatabase;
+
+		mutable TexDatabase::TextureDatabaseAnalysisResult
+			_cachedTextureDatabase;
+
+
+		// ========================================================
+		// TEX.BIN Analysis Cache
+		//
+		// 重要:
+		//
+		// 以前は Texture vector の「件数」だけを保存していた。
+		//
+		//   _cachedTexTextureCount
+		//
+		// しかし semantic-aware DDS exporter は実際の
+		// TexBin::AnalysisResult が必要。
+		//
+		// そのため TEX.BIN の解析結果全体を保持する。
+		// ========================================================
+
+		mutable Bool _hasTexAnalysis;
+
+		mutable TexBin::AnalysisResult _cachedTexAnalysis;
+
+		// 従来の件数キャッシュ。
+		//
+		// 既存ログおよび件数確認との互換性を維持するため残す。
+		mutable UInt32 _cachedTexTextureCount;
+
+
+		// ========================================================
+		// Semantic Resolver Cache
+		// ========================================================
+
+		mutable Bool _textureSemanticResolved;
+
+
+		// ========================================================
+		// Texture Output Directory Cache
+		//
+		// ReadEntry() の引数 doc は TryResolveTextureSemantics()
+		// から直接参照できないため、semantic DDS を生成する時点で
+		// 使用する出力先をFARC単位で保持する。
+		// ========================================================
+
+		mutable Filename _cachedTextureOutputDirectory;
+
+
+		// ========================================================
+		// Cache Reset
+		//
+		// 新しいFARCを処理するとき、
+		// 前のFARCのOBJ/TEX/Database情報を破棄する。
+		// ========================================================
+
+		void ResetCacheIfNeeded(
+			FarcFile& file
+		) const;
+
+
+		// ========================================================
+		// Texture Semantic Resolver
+		//
+		// OBJ / TEX / TextureDatabase の3条件が揃った時点で
+		// MML準拠の Texture vector index を解決する。
+		//
+		// Resolve() 成功後は、その結果を
+		// semantic-aware DDS exporter へ渡す。
+		// ========================================================
+
+		Bool TryResolveTextureSemantics() const;
+
+
+		// ========================================================
+		// Raw Data
+		// ========================================================
 
 		Bool ReadRawBytes(
 			FarcFile& file,
-			UInt32 offset,
-			UInt32 size,
+			const FarcArchive::Entry& entry,
 			std::vector<UChar>& data
 		) const;
 
 
-		// --------------------------------------------------------------------
-		// GZip Header Verification
-		// --------------------------------------------------------------------
+		// ========================================================
+		// GZip
+		// ========================================================
 
 		Bool VerifyGZipHeader(
 			const std::vector<UChar>& data
 		) const;
 
 
-		// --------------------------------------------------------------------
-		// GZip Decompression
-		// --------------------------------------------------------------------
-
 		Bool DecompressEntry(
-			RawEntry& entry
+			const std::vector<UChar>& compressedData,
+			UInt32 expectedSize,
+			std::vector<UChar>& decompressedData
 		) const;
 
 
-		// --------------------------------------------------------------------
-		// Diagnostic
-		// --------------------------------------------------------------------
+		// ========================================================
+		// Entry Information
+		// ========================================================
 
 		void PrintEntryInfo(
 			const FarcArchive::Entry& entry
 		) const;
 
+
+		// ========================================================
+		// Debug Hex
+		// ========================================================
 
 		void PrintHex(
 			const std::vector<UChar>& data,
@@ -290,13 +325,17 @@ namespace GPTDiva
 		) const;
 
 
+		// ========================================================
+		// Error
+		// ========================================================
+
 		void Fail(
 			const Char* message
 		) const;
 	};
 
+
 }
 
 
 #endif
-

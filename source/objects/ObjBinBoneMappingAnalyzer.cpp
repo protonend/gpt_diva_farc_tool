@@ -26,11 +26,17 @@
 //      -> unresolved detail
 //
 // 今回の重要修正:
-//   1. SkinAnalysisResult::boneCount は使用しない。
-//      現行 SkinAnalysisResult の実メンバー
-//      totalBoneCount を使用する。
+//   1. BlendWeight / BlendIndices Attribute Offset は
+//      MikuMikuLibrary Classic Mesh と同じく ObjectBase 基準で読む。
 //
-//   2. PrintBoneMappingAnalysisResult() の
+//   2. Skin ID は推測せず、実際の
+//      SkinAnalysisResult::skins[ObjectIndex].bones[].id
+//      から構築する。
+//
+//   3. Native SubMesh BoneIndex と Skin.Bones[] の Array Index を分離し、
+//      解決後に実際の Bone ID / Name を取得する。
+//
+//   4. PrintBoneMappingAnalysisResult() の
 //      const char* + const char* を廃止する。
 //      C++ではポインター同士の加算として解釈されるため、
 //      C2110になる6箇所をGePrint()分離出力へ変更する。
@@ -67,7 +73,7 @@ namespace GPTDiva
 
 		static const char* const
 			BONE_MAPPING_BUILD_MARKER =
-			"GPT_DIVA_FARC_BONE_MAPPING_FIXED_STAGE23_20260920";
+			"GPT_DIVA_FARC_BONE_MAPPING_OBJECTBASE_SKINID_STAGE24_20260920";
 
 
 		// ============================================================
@@ -264,13 +270,28 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Build a Skin ID set
+		// Build actual Skin Bone ID set from Skin.Bones[]
 		// ============================================================
 
-		static void BuildEmptySkinIdSet(
+		static Bool BuildSkinIdSet(
+			const SkinInfo* objectSkin,
 			std::set<UInt32>& ids)
 		{
 			ids.clear();
+
+			if (!objectSkin)
+				return false;
+
+			for (size_t i = 0;
+				i < objectSkin->bones.size();
+				++i)
+			{
+				ids.insert(
+					objectSkin->bones[i].id
+				);
+			}
+
+			return true;
 		}
 
 
@@ -340,7 +361,7 @@ namespace GPTDiva
 
 
 					if (vertex >=
-						mesh.vertexCount)
+						(UInt32)mesh.vertexCount)
 					{
 						continue;
 					}
@@ -499,8 +520,6 @@ namespace GPTDiva
 		// ============================================================
 
 		static Bool AnalyzeOneSubMesh(
-			const AnalysisResult& analysis,
-			const SkinAnalysisResult& skin,
 			const std::vector<UChar>& data,
 			const ObjectInfo& object,
 			UInt32 objectIndex,
@@ -508,6 +527,7 @@ namespace GPTDiva
 			UInt32 meshIndex,
 			const SubMeshInfo& subMesh,
 			UInt32 subMeshIndex,
+			const SkinInfo* objectSkin,
 			const std::set<UInt32>& skinIds,
 			BoneMappingSubMeshResult& out,
 			std::vector<Int32>& vertexOwner,
@@ -546,7 +566,7 @@ namespace GPTDiva
 
 
 				if (vertex <
-					mesh.vertexCount)
+					(UInt32)mesh.vertexCount)
 				{
 					referencedVertices.insert(
 						vertex
@@ -598,23 +618,63 @@ namespace GPTDiva
 			}
 
 
-			const UInt32 weightBase =
+			// MikuMikuLibrary Classic Mesh attribute offsets are
+			// relative to the Object reader base.
+			// Therefore BlendWeight / BlendIndices must also use
+			// ObjectBase + AttributeOffset.
+			const UInt32 weightRelativeOffset =
 				mesh.attributeOffsets[
 					BLEND_WEIGHT_ATTRIBUTE_INDEX
 				];
 
 
-			const UInt32 indexBase =
+			const UInt32 indexRelativeOffset =
 				mesh.attributeOffsets[
 					BLEND_INDEX_ATTRIBUTE_INDEX
 				];
 
 
-			if (weightBase == 0 ||
-				indexBase == 0)
+			if (weightRelativeOffset == 0U ||
+				indexRelativeOffset == 0U)
 			{
 				return true;
 			}
+
+
+			UInt32 weightBase = 0U;
+			UInt32 indexBase = 0U;
+
+
+			if (!AddUInt32(
+				object.baseOffset,
+				weightRelativeOffset,
+				weightBase))
+			{
+				return false;
+			}
+
+
+			if (!AddUInt32(
+				object.baseOffset,
+				indexRelativeOffset,
+				indexBase))
+			{
+				return false;
+			}
+
+
+			GePrint(
+				String("BONE ATTRIBUTES : ObjectBase=") +
+				UInt32ToString(object.baseOffset) +
+				String(" WeightOffset=") +
+				UInt32ToString(weightRelativeOffset) +
+				String(" WeightBase=") +
+				UInt32ToString(weightBase) +
+				String(" IndexOffset=") +
+				UInt32ToString(indexRelativeOffset) +
+				String(" IndexBase=") +
+				UInt32ToString(indexBase)
+			);
 
 
 			for (std::set<UInt32>::const_iterator vertexIt =
@@ -754,18 +814,6 @@ namespace GPTDiva
 					}
 
 
-					// ------------------------------------------------
-					// Direct Skin ID diagnostic
-					//
-					// 現在のSkinAnalysisResultの実配列名が
-					// 確定していないため、ここでは
-					// 「未照合」とする。
-					// ------------------------------------------------
-
-					(void)analysis;
-					(void)skin;
-
-
 					if (skinIds.find(
 						(UInt32)decodedIndex) !=
 						skinIds.end())
@@ -862,24 +910,19 @@ namespace GPTDiva
 
 
 					// ------------------------------------------------
-					// Candidate:
-					// nativeBoneIndex -> Skin array index
+					// Native BoneIndex -> Skin.Bones[] array index
+					// -> actual Skin Bone ID / Name
 					// ------------------------------------------------
 
-					if (nativeBoneIndex <
-						globalResult.skinBoneCount)
+					if (objectSkin &&
+						nativeBoneIndex <
+						(UInt32)objectSkin->bones.size())
 					{
 						++out.skinArrayIndexMatchCount;
-
-
 						++globalResult.subMeshBoneIndexSkinArrayMatchCount;
 
-
 						++out.resolvedSkinBoneIdCount;
-
-
 						++globalResult.resolvedSkinBoneIdCount;
-
 
 						if (nativeBoneIndex >
 							globalResult.maxResolvedSkinArrayIndex)
@@ -887,19 +930,35 @@ namespace GPTDiva
 							globalResult.maxResolvedSkinArrayIndex =
 								nativeBoneIndex;
 						}
+
+						const SkinBoneInfo& resolvedBone =
+							objectSkin->bones[(size_t)nativeBoneIndex];
+
+						if (resolvedBone.id >
+							globalResult.maxResolvedSkinBoneId)
+						{
+							globalResult.maxResolvedSkinBoneId =
+								resolvedBone.id;
+						}
+
+						if (!resolvedBone.name.empty())
+						{
+							++out.resolvedSkinBoneNameCount;
+							++globalResult.resolvedSkinBoneNameCount;
+						}
 					}
 					else
 					{
 						++out.skinArrayIndexMissingCount;
-
-
 						++globalResult.subMeshBoneIndexSkinArrayMissingCount;
 					}
 
 
 					// ------------------------------------------------
-					// Legacy:
-					// native SubMesh value -> Skin ID
+					// Legacy diagnostic:
+					// Native SubMesh BoneIndex value -> Skin Bone ID
+					// This intentionally tests the raw native value itself.
+					// It is separate from the resolved array-index path above.
 					// ------------------------------------------------
 
 					if (skinIds.find(
@@ -907,15 +966,11 @@ namespace GPTDiva
 						skinIds.end())
 					{
 						++out.legacySubMeshBoneIdSkinIdMatchCount;
-
-
 						++globalResult.legacySubMeshBoneIdSkinIdMatchCount;
 					}
 					else
 					{
 						++out.legacySubMeshBoneIdSkinIdMissingCount;
-
-
 						++globalResult.legacySubMeshBoneIdSkinIdMissingCount;
 					}
 				}
@@ -995,39 +1050,37 @@ namespace GPTDiva
 				(UInt32)analysis.objects.size();
 
 
-			result.skinCount =
-				1;
 
 
 			// --------------------------------------------------------
-			// 現行 SkinAnalysisResult では totalBoneCount を使う。
-			// boneCount は存在しない。
+			// Skin count / actual Skin IDs
 			// --------------------------------------------------------
 
-			result.skinBoneCount =
-				skin.totalBoneCount;
+			result.skinCount = 0;
+			result.skinBoneCount = 0;
+			result.skinBoneIdCount = 0;
 
+			for (size_t si = 0;
+				si < skin.skins.size();
+				++si)
+			{
+				const SkinInfo& skinInfo = skin.skins[si];
 
-			result.skinBoneIdCount =
-				skin.totalBoneCount;
+				if (!skinInfo.valid || skinInfo.bones.empty())
+					continue;
 
+				++result.skinCount;
+				result.skinBoneCount += (UInt32)skinInfo.bones.size();
+				result.skinBoneIdCount += (UInt32)skinInfo.bones.size();
 
-			// --------------------------------------------------------
-			// Skin ID set
-			//
-			// 現在のSkinAnalysisResultの骨ID配列名が
-			// このCPPから確定できないため空集合とする。
-			//
-			// これによってSkin IDを勝手に推測しない。
-			// --------------------------------------------------------
-
-			std::set<UInt32>
-				skinIds;
-
-
-			BuildEmptySkinIdSet(
-				skinIds
-			);
+				for (size_t bi = 0;
+					bi < skinInfo.bones.size();
+					++bi)
+				{
+					if (skinInfo.bones[bi].id > result.maxSkinBoneId)
+						result.maxSkinBoneId = skinInfo.bones[bi].id;
+				}
+			}
 
 
 			// --------------------------------------------------------
@@ -1042,6 +1095,19 @@ namespace GPTDiva
 					analysis.objects[
 						objectIndex
 					];
+
+				const SkinInfo* objectSkin = nullptr;
+				std::set<UInt32> skinIds;
+
+				if (objectIndex < (UInt32)skin.skins.size())
+				{
+					const SkinInfo& candidate = skin.skins[(size_t)objectIndex];
+					if (candidate.valid)
+					{
+						objectSkin = &candidate;
+						BuildSkinIdSet(objectSkin, skinIds);
+					}
+				}
 
 
 				for (UInt32 meshIndex = 0;
@@ -1126,8 +1192,6 @@ namespace GPTDiva
 
 
 						if (!AnalyzeOneSubMesh(
-							analysis,
-							skin,
 							data,
 							object,
 							objectIndex,
@@ -1135,6 +1199,7 @@ namespace GPTDiva
 							meshIndex,
 							subMesh,
 							s,
+							objectSkin,
 							skinIds,
 							subResult,
 							vertexOwner,

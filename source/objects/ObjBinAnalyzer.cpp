@@ -1,75 +1,57 @@
-
 // File : ObjBinAnalyzer.cpp
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   OBJ.BIN の ObjectSet / Texture ID Table / Object / Mesh /
-//   SubMesh Header / SubMesh BoneIndices / Index Payload /
-//   Triangle復元 / Position / Normal / UV
-//   を解析する。
+//   MikuMikuLibrary Classic ObjectSet / Object / Mesh / SubMesh /
+//   Material / MaterialTexture の実データを OBJ.BIN から解析する。
 //
-// Stage 19:
-//   MikuMikuLibrary Classic Mesh の TexCoord0 を解析する。
-//   追加:
-//   MikuMikuLibrary Classic SubMesh の BoneIndices を解析する。
+// Stage 20 FIX + POLYGON INDEX DIAGNOSTIC:
+//   Position / Normal / UV0 / Index / Triangle / Material / MaterialTexture
+//   までを一つの解析結果へ格納する。
 //
-// SubMesh BoneIndices:
+//   今回の重要修正:
+//     attributeOffsets[] は Mesh BaseOffset ではなく
+//     Object BaseOffset を基準に解決する。
+//   これは以前正常だった ObjBinAnalyzer の実装へ戻すもの。
+//   MikuMikuLibrary Classic の Object / Mesh の BaseOffset 関係に合わせる。
 //
-//   MikuMikuLibrary SubMesh.cs:
-//     boneIndexCount   = Int32
-//     boneIndicesOffset = ReadOffset()
-//     BonesPerVertex   = UInt32
+//   診断対象:
+//     PrimitiveType
+//     IndexFormat
+//     VertexCount
+//     IndexCount
+//     IndexOffset
+//     Raw Index Count
+//     Raw Index Min / Max
+//     Raw Out Of Range
+//     Raw Degenerate / Separator
+//     Triangle Count
+//     Triangle Index Min / Max
+//     Triangle Out Of Range
+//     Triangle Degenerate
+//     Raw Index Head
+//     Triangle Index Head
 //
-//   Classic:
-//     BonesPerVertex == 4 の場合だけ
-//     boneIndicesOffset から UInt16 配列を読む。
-//
-//   Native BoneIndices は UInt16 の値を UInt32 に格納する。
-//   Skin Bone ID への変換はこの段階では行わない。
-//
-// TexCoord0:
-//
-//   VertexFormatAttributes.TexCoord0 = bit 4
-//   attributeOffsets[4]
-//   Float32 U + Float32 V
-//   8 bytes / vertex
-//
-//   Native UV は Analyzer では変換しない。
-//
-// Triangle:
-//
-//   Triangle:
-//     triangleIndices = indices
-//
-//   TriangleStrip:
-//     MikuMikuLibrary Stripifier.Unstripify() 相当
+// 重要:
+//   C4D R19 の Vector component は Float64 系なので、ファイルの float32 は
+//   必ず Float32 変数へ読んでから Vector へ変換する。
 //
 // 今回やらないこと:
-//   Material
-//   Texture 実体デコード
-//   Skin
-//   Bone
-//   BoneIndices -> Skin Bone ID
-//   BlendIndices -> Skin Bone
-//   EX Data
-//   PolygonObject生成
-//
-// 次段階:
-//   SubMesh BoneIndices
-//     +
-//   Mesh BlendIndices
-//     +
-//   Skin Bone ID
-//     +
-//   Skin Bone Matrix
-//   の対応関係を実データで検証する。
+//   C4D PolygonObject の生成方法変更
+//   Winding 変更
+//   Material 変更
+//   Texture 変更
+//   TriangleStrip アルゴリズム変更
+//   Skin / Bone 変更
 // ============================================================
 
 #include "ObjBinAnalyzer.h"
 
-#include <cstring>
 #include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
 
 
 namespace GPTDiva
@@ -77,171 +59,16 @@ namespace GPTDiva
 	namespace ObjBin
 	{
 
-		// ============================================================
-		// Build marker
-		// ============================================================
-
-		static const char* const
-			OBJBIN_ANALYZER_BUILD_MARKER =
-			"GPT_DIVA_FARC_OBJBIN_SUBMESH_BONE_STAGE20_20260919";
-
 
 		// ============================================================
-		// ObjectSet signatures
-		// ============================================================
-
-		static const UInt32
-			OBJECT_SET_SIGNATURE_CLASSIC =
-			0x05062500;
-
-
-		static const UInt32
-			OBJECT_SET_SIGNATURE_MODERN =
-			0x05062501;
-
-
-		// ============================================================
-		// Header sizes
-		// ============================================================
-
-		static const UInt32
-			OBJECT_SET_HEADER_SIZE =
-			0x24;
-
-
-		static const UInt32
-			OBJECT_HEADER_SIZE =
-			0x50;
-
-
-		static const UInt32
-			MESH_HEADER_SIZE =
-			0xD8;
-
-
-		static const UInt32
-			SUBMESH_HEADER_SIZE =
-			0x5C;
-
-
-		// ============================================================
-		// Primitive types
-		// ============================================================
-
-		static const UInt32
-			PRIMITIVE_TRIANGLES =
-			4;
-
-
-		static const UInt32
-			PRIMITIVE_TRIANGLE_STRIP =
-			5;
-
-
-		// ============================================================
-		// Strip separator
-		// ============================================================
-
-		static const UInt32
-			INDEX_RESTART =
-			0xFFFFFFFFU;
-
-
-		// ============================================================
-		// Safety limits
-		// ============================================================
-
-		static const UInt32
-			MAX_OBJECT_COUNT =
-			100000;
-
-
-		static const UInt32
-			MAX_MESH_COUNT =
-			100000;
-
-
-		static const UInt32
-			MAX_SUBMESH_COUNT =
-			100000;
-
-
-		static const UInt32
-			MAX_TEXTURE_ID_COUNT =
-			1000000;
-
-
-		static const UInt32
-			MAX_BONE_INDEX_COUNT =
-			10000000;
-
-
-		// ============================================================
-		// Safe offset
-		// ============================================================
-
-		static Bool AddOffset(
-			UInt32 base,
-			UInt32 relative,
-			UInt32& result)
-		{
-			const UInt64 value =
-				(UInt64)base +
-				(UInt64)relative;
-
-
-			if (value > 0xFFFFFFFFULL)
-			{
-				return false;
-			}
-
-
-			result =
-				(UInt32)value;
-
-
-			return true;
-		}
-
-
-		static Bool AddOffsetMul(
-			UInt32 base,
-			UInt32 offset,
-			UInt32 index,
-			UInt32 stride,
-			UInt32& result)
-		{
-			const UInt64 value =
-				(UInt64)base +
-				(UInt64)offset +
-				(UInt64)index *
-				(UInt64)stride;
-
-
-			if (value > 0xFFFFFFFFULL)
-			{
-				return false;
-			}
-
-
-			result =
-				(UInt32)value;
-
-
-			return true;
-		}
-
-
-		// ============================================================
-		// BinaryReaderLE
+		// Little Endian Binary Reader
 		// ============================================================
 
 		class BinaryReaderLE
 		{
 		private:
 
-			const std::vector<UChar>&
-				_data;
+			const std::vector<UChar>& _data;
 
 
 		public:
@@ -253,84 +80,86 @@ namespace GPTDiva
 			}
 
 
-			UInt32 Size() const
-			{
-				if (_data.size() >
-					(size_t)0xFFFFFFFFULL)
-				{
-					return 0xFFFFFFFFU;
-				}
-
-
-				return
-					(UInt32)_data.size();
-			}
-
-
 			Bool CanRead(
 				UInt32 offset,
 				UInt32 size) const
 			{
-				if (offset > Size())
+				const UInt64 end =
+					(UInt64)offset +
+					(UInt64)size;
+
+				return
+					end <=
+					(UInt64)_data.size();
+			}
+
+
+			Bool ReadBytes(
+				UInt32 offset,
+				void* destination,
+				UInt32 size) const
+			{
+				if (!destination)
+					return false;
+
+				if (!CanRead(
+					offset,
+					size))
 				{
 					return false;
 				}
 
+				if (size == 0)
+					return true;
 
-				if (size > Size() - offset)
-				{
-					return false;
-				}
-
+				std::memcpy(
+					destination,
+					&_data[(size_t)offset],
+					(size_t)size
+				);
 
 				return true;
 			}
 
 
-			Bool ReadUInt8(
+			Bool ReadUChar(
 				UInt32 offset,
 				UChar& value) const
 			{
-				if (!CanRead(offset, 1))
-				{
-					return false;
-				}
-
-
-				value =
-					_data[(size_t)offset];
-
-
-				return true;
+				return ReadBytes(
+					offset,
+					&value,
+					1U
+				);
 			}
 
 
 			Bool ReadUInt16(
 				UInt32 offset,
-				UInt32& value) const
+				UInt16& value) const
 			{
-				if (!CanRead(offset, 2))
+				if (!CanRead(
+					offset,
+					2U))
 				{
 					return false;
 				}
 
-
-				const UInt32 b0 =
-					(UInt32)_data[
-						(size_t)offset
+				const UInt16 b0 =
+					(UInt16)_data[
+						(size_t)offset + 0U
 					];
 
-
-				const UInt32 b1 =
-					(UInt32)_data[
-						(size_t)offset + 1
+				const UInt16 b1 =
+					(UInt16)_data[
+						(size_t)offset + 1U
 					];
-
 
 				value =
-					b0 |
-					(b1 << 8);
-
+					(UInt16)(
+						b0 |
+						(UInt16)(b1 << 8)
+						);
 
 				return true;
 			}
@@ -340,35 +169,32 @@ namespace GPTDiva
 				UInt32 offset,
 				UInt32& value) const
 			{
-				if (!CanRead(offset, 4))
+				if (!CanRead(
+					offset,
+					4U))
 				{
 					return false;
 				}
 
-
 				const UInt32 b0 =
 					(UInt32)_data[
-						(size_t)offset
+						(size_t)offset + 0U
 					];
-
 
 				const UInt32 b1 =
 					(UInt32)_data[
-						(size_t)offset + 1
+						(size_t)offset + 1U
 					];
-
 
 				const UInt32 b2 =
 					(UInt32)_data[
-						(size_t)offset + 2
+						(size_t)offset + 2U
 					];
-
 
 				const UInt32 b3 =
 					(UInt32)_data[
-						(size_t)offset + 3
+						(size_t)offset + 3U
 					];
-
 
 				value =
 					b0 |
@@ -376,6 +202,26 @@ namespace GPTDiva
 					(b2 << 16) |
 					(b3 << 24);
 
+				return true;
+			}
+
+
+			Bool ReadInt32(
+				UInt32 offset,
+				Int32& value) const
+			{
+				UInt32 raw =
+					0;
+
+				if (!ReadUInt32(
+					offset,
+					raw))
+				{
+					return false;
+				}
+
+				value =
+					(Int32)raw;
 
 				return true;
 			}
@@ -388,7 +234,6 @@ namespace GPTDiva
 				UInt32 raw =
 					0;
 
-
 				if (!ReadUInt32(
 					offset,
 					raw))
@@ -396,21 +241,11 @@ namespace GPTDiva
 					return false;
 				}
 
-
-				float f =
-					0.0f;
-
-
 				std::memcpy(
-					&f,
+					&value,
 					&raw,
-					sizeof(float)
+					sizeof(Float32)
 				);
-
-
-				value =
-					(Float32)f;
-
 
 				return true;
 			}
@@ -421,121 +256,201 @@ namespace GPTDiva
 				UInt32 size,
 				std::string& value) const
 			{
-				if (!CanRead(offset, size))
+				value.clear();
+
+				if (!CanRead(
+					offset,
+					size))
 				{
 					return false;
 				}
-
-
-				value.clear();
-
 
 				for (UInt32 i = 0;
 					i < size;
 					++i)
 				{
-					const unsigned char c =
-						(unsigned char)_data[
+					const UChar c =
+						_data[
 							(size_t)offset + i
 						];
 
-
 					if (c == 0)
-					{
 						break;
-					}
-
 
 					value.push_back(
 						(char)c
 					);
 				}
 
-
 				return true;
+			}
+
+
+			Bool ReadCString(
+				UInt32 offset,
+				std::string& value) const
+			{
+				value.clear();
+
+				if (offset >=
+					(UInt32)_data.size())
+				{
+					return false;
+				}
+
+				const UInt32 maxCount =
+					(UInt32)_data.size() -
+					offset;
+
+				for (UInt32 i = 0;
+					i < maxCount;
+					++i)
+				{
+					const UChar c =
+						_data[
+							(size_t)offset + i
+						];
+
+					if (c == 0)
+						return true;
+
+					value.push_back(
+						(char)c
+					);
+				}
+
+				return false;
 			}
 		};
 
 
 		// ============================================================
-		// String helpers
+		// Float validation
 		// ============================================================
 
-		static String UInt32ToString(
-			UInt32 value)
-		{
-			return String::IntToString(
-				(Int64)value
-			);
-		}
-
-
-		static String Int32ToString(
-			Int32 value)
-		{
-			return String::IntToString(
-				(Int64)value
-			);
-		}
-
-
-		static String Float32ToString(
+		static Bool CheckFloat(
 			Float32 value)
 		{
-			return String::FloatToString(
-				(Float)value
-			);
-		}
-
-
-		static String ToC4DString(
-			const std::string& value)
-		{
-			String result;
-
-
-			for (size_t i = 0;
-				i < value.size();
-				++i)
-			{
-				const unsigned char c =
-					(unsigned char)value[i];
-
-
-				if (c == 0)
-				{
-					break;
-				}
-
-
-				result += String(
-					1,
-					(Utf32Char)c
-				);
-			}
-
-
-			return result;
+			return
+				std::isfinite(
+				(double)value
+				) != 0;
 		}
 
 
 		// ============================================================
-		// Bounding sphere
+		// Safe Offset
+		// ============================================================
+
+		static Bool AddOffset(
+			UInt32 base,
+			UInt32 relative,
+			UInt32& result)
+		{
+			const UInt64 value =
+				(UInt64)base +
+				(UInt64)relative;
+
+			if (value >
+				0xFFFFFFFFULL)
+			{
+				return false;
+			}
+
+			result =
+				(UInt32)value;
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Safe Offset + Index * Stride
+		// ============================================================
+
+		static Bool AddOffsetMul(
+			UInt32 base,
+			UInt32 relative,
+			UInt32 index,
+			UInt32 stride,
+			UInt32& result)
+		{
+			const UInt64 value =
+				(UInt64)base +
+				(UInt64)relative +
+				(UInt64)index *
+				(UInt64)stride;
+
+			if (value >
+				0xFFFFFFFFULL)
+			{
+				return false;
+			}
+
+			result =
+				(UInt32)value;
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Mask
+		// ============================================================
+
+		static UInt32 MaskValue(
+			UInt32 value,
+			UInt32 beginBit,
+			UInt32 endBit)
+		{
+			if (endBit <= beginBit ||
+				beginBit >= 32U)
+			{
+				return 0U;
+			}
+
+			const UInt32 width =
+				endBit -
+				beginBit;
+
+			if (width >= 32U)
+				return
+				value >>
+				beginBit;
+
+			const UInt32 mask =
+				(1U << width) - 1U;
+
+			return
+				(value >> beginBit) &
+				mask;
+		}
+
+
+		// ============================================================
+		// Bounding Sphere
 		// ============================================================
 
 		static Bool ReadBoundingSphere(
 			const BinaryReaderLE& reader,
 			UInt32 offset,
-			Vector& center,
-			Float32& radius)
+			BoundingSphereInfo& sphere)
 		{
-			Float32 x = 0.0f;
-			Float32 y = 0.0f;
-			Float32 z = 0.0f;
+			Float32 x =
+				0.0f;
+
+			Float32 y =
+				0.0f;
+
+			Float32 z =
+				0.0f;
+
+			Float32 radius =
+				0.0f;
 
 
 			if (!reader.ReadFloat32(
-				offset + 0,
+				offset + 0U,
 				x))
 			{
 				return false;
@@ -543,7 +458,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadFloat32(
-				offset + 4,
+				offset + 4U,
 				y))
 			{
 				return false;
@@ -551,7 +466,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadFloat32(
-				offset + 8,
+				offset + 8U,
 				z))
 			{
 				return false;
@@ -559,271 +474,388 @@ namespace GPTDiva
 
 
 			if (!reader.ReadFloat32(
-				offset + 12,
+				offset + 12U,
 				radius))
 			{
 				return false;
 			}
 
 
-			center.x = (Float)x;
-			center.y = (Float)y;
-			center.z = (Float)z;
+			if (!CheckFloat(x) ||
+				!CheckFloat(y) ||
+				!CheckFloat(z) ||
+				!CheckFloat(radius))
+			{
+				return false;
+			}
 
+
+			sphere.center =
+				Vector(
+				(Float)x,
+					(Float)y,
+					(Float)z
+				);
+
+			sphere.radius =
+				radius;
 
 			return true;
 		}
 
 
 		// ============================================================
-		// ObjectSet
+		// Material Texture
 		// ============================================================
 
-		static Bool ReadObjectSet(
+		static Bool ParseMaterialTexture(
 			const BinaryReaderLE& reader,
-			ObjectSetInfo& info)
+			UInt32 offset,
+			MaterialTextureInfo& texture)
 		{
 			if (!reader.CanRead(
-				0,
-				OBJECT_SET_HEADER_SIZE))
+				offset,
+				MATERIAL_TEXTURE_BYTE_SIZE))
 			{
 				return false;
 			}
 
 
-			info =
-				ObjectSetInfo();
+			texture =
+				MaterialTextureInfo();
 
 
 			if (!reader.ReadUInt32(
-				0,
-				info.signature))
-			{
-				return false;
-			}
-
-
-			if (info.signature !=
-				OBJECT_SET_SIGNATURE_CLASSIC &&
-				info.signature !=
-				OBJECT_SET_SIGNATURE_MODERN)
+				offset + 0x00U,
+				texture.samplerFlags))
 			{
 				return false;
 			}
 
 
 			if (!reader.ReadUInt32(
-				4,
-				info.objectCount))
+				offset + 0x04U,
+				texture.textureId))
 			{
 				return false;
 			}
 
 
 			if (!reader.ReadUInt32(
-				8,
-				info.globalBoneCount))
+				offset + 0x08U,
+				texture.textureFlags))
 			{
 				return false;
 			}
 
 
-			info.globalBoneFieldRaw =
-				info.globalBoneCount;
-
-
-			info.globalBoneFieldIsClassicSentinel =
-				(info.globalBoneCount == 0x39393939U);
-
-
-			if (!reader.ReadUInt32(
-				12,
-				info.objectsOffset))
+			if (!reader.ReadFixedString(
+				offset + 0x0CU,
+				8U,
+				texture.extraShaderName))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				16,
-				info.objectSkinsOffset))
+			if (!reader.ReadFloat32(
+				offset + 0x14U,
+				texture.weight))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				20,
-				info.objectNamesOffset))
+			if (!CheckFloat(
+				texture.weight))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				24,
-				info.objectIDsOffset))
-			{
-				return false;
-			}
-
-
-			if (!reader.ReadUInt32(
-				28,
-				info.textureIDsOffset))
-			{
-				return false;
-			}
-
-
-			if (!reader.ReadUInt32(
-				32,
-				info.textureIDCount))
-			{
-				return false;
-			}
-
-
-			return true;
-		}
-
-
-		// ============================================================
-		// Texture IDs
-		// ============================================================
-
-		static Bool ParseTextureIDs(
-			const BinaryReaderLE& reader,
-			const ObjectSetInfo& info,
-			std::vector<UInt32>& textureIDs)
-		{
-			textureIDs.clear();
-
-
-			if (info.textureIDCount == 0)
-			{
-				return true;
-			}
-
-
-			if (info.textureIDCount >
-				MAX_TEXTURE_ID_COUNT)
-			{
-				return false;
-			}
-
-
-			if (info.textureIDsOffset == 0)
-			{
-				return false;
-			}
-
-
-			const UInt64 tableEnd =
-				(UInt64)info.textureIDsOffset +
-				(UInt64)info.textureIDCount * 4ULL;
-
-
-			if (tableEnd >
-				(UInt64)reader.Size())
-			{
-				return false;
-			}
-
-
-			try
-			{
-				textureIDs.reserve(
-					(size_t)info.textureIDCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
-				i < info.textureIDCount;
+			for (Int32 i = 0;
+				i < 16;
 				++i)
 			{
-				UInt32 offset = 0;
-
-
-				if (!AddOffsetMul(
-					0,
-					info.textureIDsOffset,
-					i,
-					4,
-					offset))
+				if (!reader.ReadFloat32(
+					offset +
+					0x18U +
+					(UInt32)i * 4U,
+					texture.textureCoordinateMatrix[i]))
 				{
 					return false;
 				}
 
-
-				UInt32 textureID = 0;
-
-
-				if (!reader.ReadUInt32(
-					offset,
-					textureID))
+				if (!CheckFloat(
+					texture.textureCoordinateMatrix[i]))
 				{
 					return false;
 				}
-
-
-				textureIDs.push_back(
-					textureID
-				);
 			}
 
 
-			return
-				textureIDs.size() ==
-				(size_t)info.textureIDCount;
+			texture.repeatU =
+				MaskValue(
+					texture.samplerFlags,
+					0U,
+					1U
+				) != 0U;
+
+			texture.repeatV =
+				MaskValue(
+					texture.samplerFlags,
+					1U,
+					2U
+				) != 0U;
+
+			texture.mirrorU =
+				MaskValue(
+					texture.samplerFlags,
+					2U,
+					3U
+				) != 0U;
+
+			texture.mirrorV =
+				MaskValue(
+					texture.samplerFlags,
+					3U,
+					4U
+				) != 0U;
+
+			texture.ignoreAlpha =
+				MaskValue(
+					texture.samplerFlags,
+					4U,
+					5U
+				) != 0U;
+
+			texture.blend =
+				MaskValue(
+					texture.samplerFlags,
+					5U,
+					10U
+				);
+
+			texture.alphaBlend =
+				MaskValue(
+					texture.samplerFlags,
+					10U,
+					15U
+				);
+
+			texture.border =
+				MaskValue(
+					texture.samplerFlags,
+					15U,
+					16U
+				) != 0U;
+
+			texture.clampToEdge =
+				MaskValue(
+					texture.samplerFlags,
+					16U,
+					17U
+				) != 0U;
+
+			texture.filter =
+				MaskValue(
+					texture.samplerFlags,
+					17U,
+					20U
+				);
+
+			texture.mipMap =
+				MaskValue(
+					texture.samplerFlags,
+					20U,
+					22U
+				);
+
+			texture.mipMapBias =
+				MaskValue(
+					texture.samplerFlags,
+					22U,
+					30U
+				);
+
+			texture.anisotropicFilter =
+				MaskValue(
+					texture.samplerFlags,
+					30U,
+					32U
+				);
+
+			texture.type =
+				MaskValue(
+					texture.textureFlags,
+					0U,
+					4U
+				);
+
+			texture.textureCoordinateIndex =
+				MaskValue(
+					texture.textureFlags,
+					4U,
+					8U
+				);
+
+			texture.textureCoordinateTranslationType =
+				MaskValue(
+					texture.textureFlags,
+					8U,
+					11U
+				);
+
+			return true;
 		}
 
 
 		// ============================================================
-		// Object
+		// Material
 		// ============================================================
 
-		static Bool ParseObject(
+		static Bool ParseMaterial(
 			const BinaryReaderLE& reader,
-			UInt32 objectOffset,
-			ObjectInfo& object)
+			UInt32 offset,
+			MaterialInfo& material)
 		{
-			object =
-				ObjectInfo();
-
-
-			object.objectOffset =
-				objectOffset;
-
-
-			object.baseOffset =
-				objectOffset;
-
-
 			if (!reader.CanRead(
-				objectOffset,
-				OBJECT_HEADER_SIZE))
+				offset,
+				MATERIAL_BYTE_SIZE))
+			{
+				return false;
+			}
+
+
+			material =
+				MaterialInfo();
+
+
+			if (!reader.ReadUInt32(
+				offset + 0x04U,
+				material.flags))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadFixedString(
+				offset + 0x08U,
+				8U,
+				material.shaderName))
 			{
 				return false;
 			}
 
 
 			if (!reader.ReadUInt32(
-				objectOffset + 0,
-				object.signature))
+				offset + 0x10U,
+				material.shaderFlags))
 			{
 				return false;
 			}
 
 
+			material.textures.clear();
+			material.textures.resize(8);
+
+
+			for (Int32 i = 0;
+				i < 8;
+				++i)
+			{
+				if (!ParseMaterialTexture(
+					reader,
+					offset +
+					0x14U +
+					(UInt32)i *
+					MATERIAL_TEXTURE_BYTE_SIZE,
+					material.textures[(size_t)i]))
+				{
+					return false;
+				}
+			}
+
+
 			if (!reader.ReadUInt32(
-				objectOffset + 4,
-				object.unused))
+				offset + 0x3D4U,
+				material.blendFlags))
+			{
+				return false;
+			}
+
+
+			for (Int32 i = 0;
+				i < 4;
+				++i)
+			{
+				if (!reader.ReadFloat32(
+					offset +
+					0x3D8U +
+					(UInt32)i * 4U,
+					material.diffuse[i]))
+				{
+					return false;
+				}
+			}
+
+
+			for (Int32 i = 0;
+				i < 4;
+				++i)
+			{
+				if (!reader.ReadFloat32(
+					offset +
+					0x3E8U +
+					(UInt32)i * 4U,
+					material.ambient[i]))
+				{
+					return false;
+				}
+			}
+
+
+			for (Int32 i = 0;
+				i < 4;
+				++i)
+			{
+				if (!reader.ReadFloat32(
+					offset +
+					0x3F8U +
+					(UInt32)i * 4U,
+					material.specular[i]))
+				{
+					return false;
+				}
+			}
+
+
+			for (Int32 i = 0;
+				i < 4;
+				++i)
+			{
+				if (!reader.ReadFloat32(
+					offset +
+					0x408U +
+					(UInt32)i * 4U,
+					material.emission[i]))
+				{
+					return false;
+				}
+			}
+
+
+			if (!reader.ReadFloat32(
+				offset + 0x418U,
+				material.shininess))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadFloat32(
+				offset + 0x41CU,
+				material.intensity))
 			{
 				return false;
 			}
@@ -831,55 +863,66 @@ namespace GPTDiva
 
 			if (!ReadBoundingSphere(
 				reader,
-				objectOffset + 8,
-				object.boundingSphereCenter,
-				object.boundingSphereRadius))
+				offset + 0x420U,
+				material.reservedSphere))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				objectOffset + 24,
-				object.meshCount))
+			if (!reader.ReadFixedString(
+				offset + 0x430U,
+				64U,
+				material.name))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				objectOffset + 28,
-				object.meshesOffset))
+			if (!reader.ReadFloat32(
+				offset + 0x470U,
+				material.bumpDepth))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				objectOffset + 32,
-				object.materialCount))
+			for (Int32 i = 0;
+				i < 4;
+				++i)
 			{
-				return false;
+				if (!CheckFloat(
+					material.diffuse[i]) ||
+					!CheckFloat(
+						material.ambient[i]) ||
+					!CheckFloat(
+						material.specular[i]) ||
+					!CheckFloat(
+						material.emission[i]))
+				{
+					return false;
+				}
 			}
 
 
-			if (!reader.ReadUInt32(
-				objectOffset + 36,
-				object.materialsOffset))
-			{
-				return false;
-			}
-
-
-			return true;
+			return
+				CheckFloat(
+					material.shininess
+				) &&
+				CheckFloat(
+					material.intensity
+				) &&
+				CheckFloat(
+					material.bumpDepth
+				);
 		}
 
 
 		// ============================================================
-		// Mesh
+		// Mesh Header
 		// ============================================================
 
-		static Bool ParseMesh(
+		static Bool ParseMeshHeader(
 			const BinaryReaderLE& reader,
 			UInt32 meshBase,
 			MeshInfo& mesh)
@@ -887,10 +930,8 @@ namespace GPTDiva
 			mesh =
 				MeshInfo();
 
-
 			mesh.meshOffset =
 				meshBase;
-
 
 			mesh.baseOffset =
 				meshBase;
@@ -905,7 +946,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 0,
+				meshBase + 0x00U,
 				mesh.unusedFlags))
 			{
 				return false;
@@ -914,16 +955,15 @@ namespace GPTDiva
 
 			if (!ReadBoundingSphere(
 				reader,
-				meshBase + 4,
-				mesh.boundingSphere.center,
-				mesh.boundingSphere.radius))
+				meshBase + 0x04U,
+				mesh.boundingSphere))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				meshBase + 20,
+			if (!reader.ReadInt32(
+				meshBase + 0x14U,
 				mesh.subMeshCount))
 			{
 				return false;
@@ -931,7 +971,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 24,
+				meshBase + 0x18U,
 				mesh.subMeshesOffset))
 			{
 				return false;
@@ -939,7 +979,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 28,
+				meshBase + 0x1CU,
 				mesh.vertexFormat))
 			{
 				return false;
@@ -947,16 +987,23 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 32,
+				meshBase + 0x20U,
 				mesh.vertexSize))
 			{
 				return false;
 			}
 
 
-			if (!reader.ReadUInt32(
-				meshBase + 36,
+			if (!reader.ReadInt32(
+				meshBase + 0x24U,
 				mesh.vertexCount))
+			{
+				return false;
+			}
+
+
+			if (mesh.subMeshCount < 0 ||
+				mesh.vertexCount < 0)
 			{
 				return false;
 			}
@@ -966,14 +1013,10 @@ namespace GPTDiva
 				i < OBJ_BIN_ATTRIBUTE_COUNT;
 				++i)
 			{
-				const UInt32 fieldOffset =
-					meshBase +
-					40 +
-					(UInt32)i * 4;
-
-
 				if (!reader.ReadUInt32(
-					fieldOffset,
+					meshBase +
+					0x28U +
+					(UInt32)i * 4U,
 					mesh.attributeOffsets[i]))
 				{
 					return false;
@@ -982,7 +1025,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 120,
+				meshBase + 0x78U,
 				mesh.flags))
 			{
 				return false;
@@ -990,7 +1033,7 @@ namespace GPTDiva
 
 
 			if (!reader.ReadUInt32(
-				meshBase + 124,
+				meshBase + 0x7CU,
 				mesh.vertexFormatIndex))
 			{
 				return false;
@@ -998,8 +1041,8 @@ namespace GPTDiva
 
 
 			if (!reader.ReadFixedString(
-				meshBase + 152,
-				64,
+				meshBase + 0x98U,
+				64U,
 				mesh.name))
 			{
 				return false;
@@ -1011,734 +1054,11 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Parse Classic SubMesh BoneIndices
-		//
-		// MikuMikuLibrary:
-		//
-		//   int boneIndexCount = reader.ReadInt32();
-		//   long boneIndicesOffset = reader.ReadOffset();
-		//   BonesPerVertex = reader.ReadUInt32();
-		//
-		//   reader.ReadAtOffsetIf(
-		//       BonesPerVertex == 4,
-		//       boneIndicesOffset,
-		//       () => {
-		//           BoneIndices =
-		//               reader.ReadUInt16s(
-		//                   boneIndexCount);
-		//       });
-		//
-		// Classic ObjectSetではOffsetはObject側の
-		// BaseOffsetを基準に扱われる。
-		//
-		// このC++実装では:
-		//
-		//   objectBase + boneIndicesOffset
-		//
-		// として読む。
+		// Position
 		//
 		// IMPORTANT:
-		//   ここでは値をSkin Bone IDへ変換しない。
-		//   UInt16 Native値をUInt32へ保持するだけ。
-		// ============================================================
-
-		static Bool ParseSubMeshBoneIndices(
-			const BinaryReaderLE& reader,
-			UInt32 objectBase,
-			SubMeshInfo& subMesh)
-		{
-			subMesh.boneIndices.clear();
-
-
-			// --------------------------------------------------------
-			// MikuMikuLibrary SubMesh.cs:
-			//
-			// BoneIndices are only read when
-			//
-			//     BonesPerVertex == 4
-			//
-			// --------------------------------------------------------
-
-			if (subMesh.bonesPerVertex != 4)
-			{
-				return true;
-			}
-
-
-			if (subMesh.boneIndexCount == 0)
-			{
-				return true;
-			}
-
-
-			if (subMesh.boneIndexCount >
-				MAX_BONE_INDEX_COUNT)
-			{
-				GePrint(
-					"OBJ.BIN ERROR : "
-					"SubMesh BoneIndexCount exceeds safety limit\n"
-				);
-
-
-				return false;
-			}
-
-
-			if (subMesh.boneIndicesOffset == 0)
-			{
-				GePrint(
-					"OBJ.BIN ERROR : "
-					"SubMesh BoneIndices exists but offset is zero\n"
-				);
-
-
-				return false;
-			}
-
-
-			UInt32 boneIndexBase =
-				0;
-
-
-			if (!AddOffset(
-				objectBase,
-				subMesh.boneIndicesOffset,
-				boneIndexBase))
-			{
-				return false;
-			}
-
-
-			const UInt64 required =
-				(UInt64)boneIndexBase +
-				(UInt64)subMesh.boneIndexCount *
-				2ULL;
-
-
-			if (required >
-				(UInt64)reader.Size())
-			{
-				GePrint(
-					"OBJ.BIN ERROR : "
-					"SubMesh BoneIndices range is outside OBJ.BIN\n"
-				);
-
-
-				return false;
-			}
-
-
-			try
-			{
-				subMesh.boneIndices.reserve(
-					(size_t)subMesh.boneIndexCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
-				i < subMesh.boneIndexCount;
-				++i)
-			{
-				UInt32 currentOffset =
-					0;
-
-
-				if (!AddOffsetMul(
-					boneIndexBase,
-					0,
-					i,
-					2,
-					currentOffset))
-				{
-					return false;
-				}
-
-
-				UInt32 nativeBoneIndex =
-					0;
-
-
-				if (!reader.ReadUInt16(
-					currentOffset,
-					nativeBoneIndex))
-				{
-					return false;
-				}
-
-
-				subMesh.boneIndices.push_back(
-					nativeBoneIndex
-				);
-			}
-
-
-			return
-				subMesh.boneIndices.size() ==
-				(size_t)subMesh.boneIndexCount;
-		}
-
-
-		// ============================================================
-		// SubMeshes
-		// ============================================================
-
-		static Bool ParseMeshSubMeshes(
-			const BinaryReaderLE& reader,
-			UInt32 objectBase,
-			MeshInfo& mesh)
-		{
-			mesh.subMeshes.clear();
-
-
-			if (mesh.subMeshCount == 0)
-			{
-				return true;
-			}
-
-
-			if (mesh.subMeshCount >
-				MAX_SUBMESH_COUNT)
-			{
-				return false;
-			}
-
-
-			if (mesh.subMeshesOffset == 0)
-			{
-				return false;
-			}
-
-
-			try
-			{
-				mesh.subMeshes.reserve(
-					(size_t)mesh.subMeshCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
-				i < mesh.subMeshCount;
-				++i)
-			{
-				UInt32 subMeshBase =
-					0;
-
-
-				if (!AddOffsetMul(
-					objectBase,
-					mesh.subMeshesOffset,
-					i,
-					SUBMESH_HEADER_SIZE,
-					subMeshBase))
-				{
-					return false;
-				}
-
-
-				if (!reader.CanRead(
-					subMeshBase,
-					SUBMESH_HEADER_SIZE))
-				{
-					return false;
-				}
-
-
-				SubMeshInfo subMesh;
-
-
-				subMesh.baseOffset =
-					subMeshBase;
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 0,
-					subMesh.unusedFlags))
-				{
-					return false;
-				}
-
-
-				if (!ReadBoundingSphere(
-					reader,
-					subMeshBase + 4,
-					subMesh.boundingSphere.center,
-					subMesh.boundingSphere.radius))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 20,
-					subMesh.materialIndex))
-				{
-					return false;
-				}
-
-
-				// ----------------------------------------------------
-				// Offset +24 .. +31
-				//
-				// MikuMikuLibrary:
-				// TexCoordIndices = reader.ReadBytes(8)
-				//
-				// Current C++ analyzer does not yet expose these.
-				// Therefore these bytes are intentionally skipped.
-				// ----------------------------------------------------
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 32,
-					subMesh.boneIndexCount))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 36,
-					subMesh.boneIndicesOffset))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 40,
-					subMesh.bonesPerVertex))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 44,
-					subMesh.primitiveType))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 48,
-					subMesh.indexFormat))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 52,
-					subMesh.indexCount))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 56,
-					subMesh.indicesOffset))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 60,
-					subMesh.subMeshFlags))
-				{
-					return false;
-				}
-
-
-				if (!reader.ReadUInt32(
-					subMeshBase + 88,
-					subMesh.indexOffset))
-				{
-					return false;
-				}
-
-
-				// ----------------------------------------------------
-				// NEW:
-				//
-				// Native Classic SubMesh BoneIndices
-				// ----------------------------------------------------
-
-				if (!ParseSubMeshBoneIndices(
-					reader,
-					objectBase,
-					subMesh))
-				{
-					return false;
-				}
-
-
-				mesh.subMeshes.push_back(
-					subMesh
-				);
-			}
-
-
-			return
-				mesh.subMeshes.size() ==
-				(size_t)mesh.subMeshCount;
-		}
-
-
-		// ============================================================
-		// Index payload
-		// ============================================================
-
-		static Bool ParseIndexPayload(
-			const BinaryReaderLE& reader,
-			UInt32 objectBase,
-			SubMeshInfo& subMesh)
-		{
-			subMesh.indices.clear();
-
-
-			if (subMesh.indexCount == 0)
-			{
-				return true;
-			}
-
-
-			UInt32 elementSize =
-				0;
-
-
-			switch (subMesh.indexFormat)
-			{
-			case 0:
-				elementSize = 1;
-				break;
-
-			case 1:
-				elementSize = 2;
-				break;
-
-			case 2:
-				elementSize = 4;
-				break;
-
-			default:
-				return false;
-			}
-
-
-			if (subMesh.indicesOffset == 0)
-			{
-				return false;
-			}
-
-
-			UInt32 indexBase =
-				0;
-
-
-			if (!AddOffset(
-				objectBase,
-				subMesh.indicesOffset,
-				indexBase))
-			{
-				return false;
-			}
-
-
-			const UInt64 payloadSize =
-				(UInt64)subMesh.indexCount *
-				(UInt64)elementSize;
-
-
-			if ((UInt64)indexBase +
-				payloadSize >
-				(UInt64)reader.Size())
-			{
-				return false;
-			}
-
-
-			try
-			{
-				subMesh.indices.reserve(
-					(size_t)subMesh.indexCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
-				i < subMesh.indexCount;
-				++i)
-			{
-				UInt32 currentOffset =
-					0;
-
-
-				if (!AddOffsetMul(
-					indexBase,
-					0,
-					i,
-					elementSize,
-					currentOffset))
-				{
-					return false;
-				}
-
-
-				UInt32 value =
-					0;
-
-
-				switch (subMesh.indexFormat)
-				{
-				case 0:
-				{
-					UChar index =
-						0;
-
-
-					if (!reader.ReadUInt8(
-						currentOffset,
-						index))
-					{
-						return false;
-					}
-
-
-					value =
-						(UInt32)index;
-
-
-					if (value == 0xFFU)
-					{
-						value =
-							INDEX_RESTART;
-					}
-				}
-				break;
-
-
-				case 1:
-
-					if (!reader.ReadUInt16(
-						currentOffset,
-						value))
-					{
-						return false;
-					}
-
-
-					if (value == 0xFFFFU)
-					{
-						value =
-							INDEX_RESTART;
-					}
-
-					break;
-
-
-				case 2:
-
-					if (!reader.ReadUInt32(
-						currentOffset,
-						value))
-					{
-						return false;
-					}
-
-					break;
-
-
-				default:
-					return false;
-				}
-
-
-				subMesh.indices.push_back(
-					value
-				);
-			}
-
-
-			return
-				subMesh.indices.size() ==
-				(size_t)subMesh.indexCount;
-		}
-
-
-		// ============================================================
-		// Triangle conversion
-		// ============================================================
-
-		static Bool BuildTriangleIndices(
-			const std::vector<UInt32>& indices,
-			UInt32 primitiveType,
-			std::vector<UInt32>& triangleIndices)
-		{
-			triangleIndices.clear();
-
-
-			if (indices.empty())
-			{
-				return true;
-			}
-
-
-			if (primitiveType ==
-				PRIMITIVE_TRIANGLES)
-			{
-				if ((indices.size() % 3) != 0)
-				{
-					return false;
-				}
-
-
-				triangleIndices =
-					indices;
-
-
-				return true;
-			}
-
-
-			if (primitiveType ==
-				PRIMITIVE_TRIANGLE_STRIP)
-			{
-				if (indices.size() < 3)
-				{
-					return true;
-				}
-
-
-				try
-				{
-					triangleIndices.reserve(
-						(indices.size() - 2) * 3
-					);
-				}
-				catch (...)
-				{
-					return false;
-				}
-
-
-				size_t position =
-					0;
-
-
-				if (indices.size() < 2)
-				{
-					return true;
-				}
-
-
-				UInt32 a =
-					indices[position++];
-
-
-				UInt32 b =
-					indices[position++];
-
-
-				Bool direction =
-					false;
-
-
-				while (position <
-					indices.size())
-				{
-					const UInt32 c =
-						indices[position++];
-
-
-					if (c ==
-						INDEX_RESTART)
-					{
-						if (position + 1 >=
-							indices.size())
-						{
-							return false;
-						}
-
-
-						a =
-							indices[position++];
-
-
-						b =
-							indices[position++];
-
-
-						direction =
-							false;
-
-
-						continue;
-					}
-
-
-					direction =
-						!direction;
-
-
-					if (a != b &&
-						b != c &&
-						c != a)
-					{
-						if (direction)
-						{
-							triangleIndices.push_back(a);
-							triangleIndices.push_back(b);
-							triangleIndices.push_back(c);
-						}
-						else
-						{
-							triangleIndices.push_back(a);
-							triangleIndices.push_back(c);
-							triangleIndices.push_back(b);
-						}
-					}
-
-
-					a =
-						b;
-
-					b =
-						c;
-				}
-
-
-				return
-					(triangleIndices.size() % 3) == 0;
-			}
-
-
-			GePrint(
-				"OBJ.BIN ERROR : "
-				"UNSUPPORTED PRIMITIVE TYPE FOR TRIANGLE CONVERSION\n"
-			);
-
-
-			return false;
-		}
-
-
-		// ============================================================
-		// Parse Positions
+		//   attributeOffsets[0] is relative to Object BaseOffset.
+		//   Do NOT use Mesh BaseOffset here.
 		// ============================================================
 
 		static Bool ParsePositions(
@@ -1751,23 +1071,21 @@ namespace GPTDiva
 
 
 			if (sourceMesh.vertexCount == 0)
-			{
 				return true;
-			}
 
 
 			if ((sourceMesh.vertexFormat &
-				VERTEX_ATTRIBUTE_POSITION) == 0)
+				VERTEX_ATTRIBUTE_POSITION) == 0U)
 			{
 				return true;
 			}
 
 
-			const UInt32 relativeOffset =
+			const UInt32 relativePositionOffset =
 				sourceMesh.attributeOffsets[0];
 
 
-			if (relativeOffset == 0)
+			if (relativePositionOffset == 0U)
 			{
 				return false;
 			}
@@ -1779,7 +1097,7 @@ namespace GPTDiva
 
 			if (!AddOffset(
 				objectBase,
-				relativeOffset,
+				relativePositionOffset,
 				positionBase))
 			{
 				return false;
@@ -1787,37 +1105,53 @@ namespace GPTDiva
 
 
 			const UInt64 required =
-				(UInt64)positionBase +
 				(UInt64)sourceMesh.vertexCount *
 				12ULL;
 
 
+			// ========================================================
+			// FIX:
+			//   reader.CanRead は関数なので UInt64 へキャストしない。
+			//   必要バイト数だけを UInt32 として CanRead() に渡す。
+			// ========================================================
+
 			if (required >
-				(UInt64)reader.Size())
+				0xFFFFFFFFULL)
 			{
 				return false;
 			}
 
 
-			try
-			{
-				destinationMesh.positions.reserve(
-					(size_t)sourceMesh.vertexCount
-				);
-			}
-			catch (...)
+			if (!reader.CanRead(
+				positionBase,
+				(UInt32)required))
 			{
 				return false;
 			}
 
 
-			for (UInt32 i = 0;
+			destinationMesh.positions.reserve(
+				(size_t)sourceMesh.vertexCount
+			);
+
+
+			for (Int32 i = 0;
 				i < sourceMesh.vertexCount;
 				++i)
 			{
-				const UInt32 vertexOffset =
-					positionBase +
-					i * 12U;
+				UInt32 offset =
+					0;
+
+
+				if (!AddOffsetMul(
+					positionBase,
+					0U,
+					(UInt32)i,
+					12U,
+					offset))
+				{
+					return false;
+				}
 
 
 				Float32 x =
@@ -1831,42 +1165,43 @@ namespace GPTDiva
 
 
 				if (!reader.ReadFloat32(
-					vertexOffset + 0,
-					x) ||
-					!reader.ReadFloat32(
-						vertexOffset + 4,
-						y) ||
-					!reader.ReadFloat32(
-						vertexOffset + 8,
-						z))
+					offset + 0U,
+					x))
 				{
 					return false;
 				}
 
 
-				if (!std::isfinite((double)x) ||
-					!std::isfinite((double)y) ||
-					!std::isfinite((double)z))
+				if (!reader.ReadFloat32(
+					offset + 4U,
+					y))
 				{
 					return false;
 				}
 
 
-				Vector value;
+				if (!reader.ReadFloat32(
+					offset + 8U,
+					z))
+				{
+					return false;
+				}
 
 
-				value.x =
-					(Float)x;
-
-				value.y =
-					(Float)y;
-
-				value.z =
-					(Float)z;
+				if (!CheckFloat(x) ||
+					!CheckFloat(y) ||
+					!CheckFloat(z))
+				{
+					return false;
+				}
 
 
 				destinationMesh.positions.push_back(
-					value
+					Vector(
+					(Float)x,
+						(Float)y,
+						(Float)z
+					)
 				);
 			}
 
@@ -1878,7 +1213,10 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Parse Native Normals
+		// Normal
+		//
+		// IMPORTANT:
+		//   attributeOffsets[1] is relative to Object BaseOffset.
 		// ============================================================
 
 		static Bool ParseNormals(
@@ -1891,23 +1229,21 @@ namespace GPTDiva
 
 
 			if (sourceMesh.vertexCount == 0)
-			{
 				return true;
-			}
 
 
 			if ((sourceMesh.vertexFormat &
-				VERTEX_ATTRIBUTE_NORMAL) == 0)
+				VERTEX_ATTRIBUTE_NORMAL) == 0U)
 			{
 				return true;
 			}
 
 
-			const UInt32 relativeOffset =
+			const UInt32 relativeNormalOffset =
 				sourceMesh.attributeOffsets[1];
 
 
-			if (relativeOffset == 0)
+			if (relativeNormalOffset == 0U)
 			{
 				return false;
 			}
@@ -1919,45 +1255,35 @@ namespace GPTDiva
 
 			if (!AddOffset(
 				objectBase,
-				relativeOffset,
+				relativeNormalOffset,
 				normalBase))
 			{
 				return false;
 			}
 
 
-			const UInt64 required =
-				(UInt64)normalBase +
-				(UInt64)sourceMesh.vertexCount *
-				12ULL;
+			destinationMesh.normals.reserve(
+				(size_t)sourceMesh.vertexCount
+			);
 
 
-			if (required >
-				(UInt64)reader.Size())
-			{
-				return false;
-			}
-
-
-			try
-			{
-				destinationMesh.normals.reserve(
-					(size_t)sourceMesh.vertexCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
+			for (Int32 i = 0;
 				i < sourceMesh.vertexCount;
 				++i)
 			{
-				const UInt32 vertexOffset =
-					normalBase +
-					i * 12U;
+				UInt32 offset =
+					0;
+
+
+				if (!AddOffsetMul(
+					normalBase,
+					0U,
+					(UInt32)i,
+					12U,
+					offset))
+				{
+					return false;
+				}
 
 
 				Float32 x =
@@ -1971,42 +1297,43 @@ namespace GPTDiva
 
 
 				if (!reader.ReadFloat32(
-					vertexOffset + 0,
-					x) ||
-					!reader.ReadFloat32(
-						vertexOffset + 4,
-						y) ||
-					!reader.ReadFloat32(
-						vertexOffset + 8,
-						z))
+					offset + 0U,
+					x))
 				{
 					return false;
 				}
 
 
-				if (!std::isfinite((double)x) ||
-					!std::isfinite((double)y) ||
-					!std::isfinite((double)z))
+				if (!reader.ReadFloat32(
+					offset + 4U,
+					y))
 				{
 					return false;
 				}
 
 
-				Vector normal;
+				if (!reader.ReadFloat32(
+					offset + 8U,
+					z))
+				{
+					return false;
+				}
 
 
-				normal.x =
-					(Float)x;
-
-				normal.y =
-					(Float)y;
-
-				normal.z =
-					(Float)z;
+				if (!CheckFloat(x) ||
+					!CheckFloat(y) ||
+					!CheckFloat(z))
+				{
+					return false;
+				}
 
 
 				destinationMesh.normals.push_back(
-					normal
+					Vector(
+					(Float)x,
+						(Float)y,
+						(Float)z
+					)
 				);
 			}
 
@@ -2018,10 +1345,13 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Parse Native TexCoord0
+		// UV0
+		//
+		// IMPORTANT:
+		//   attributeOffsets[4] is relative to Object BaseOffset.
 		// ============================================================
 
-		static Bool ParseTexCoords0(
+		static Bool ParseUV0(
 			const BinaryReaderLE& reader,
 			UInt32 objectBase,
 			const MeshInfo& sourceMesh,
@@ -2031,48 +1361,22 @@ namespace GPTDiva
 
 
 			if (sourceMesh.vertexCount == 0)
-			{
 				return true;
-			}
 
 
 			if ((sourceMesh.vertexFormat &
-				VERTEX_ATTRIBUTE_TEXCOORD0) == 0)
+				VERTEX_ATTRIBUTE_TEXCOORD0) == 0U)
 			{
 				return true;
 			}
 
 
-			const UInt32 relativeOffset =
+			const UInt32 relativeUVOffset =
 				sourceMesh.attributeOffsets[4];
 
 
-			if (relativeOffset == 0)
+			if (relativeUVOffset == 0U)
 			{
-				GePrint(
-					"OBJ.BIN UV ERROR : "
-					"TexCoord0 attribute exists but offset is zero\n"
-				);
-
-
-				GePrint(
-					"  Mesh : " +
-					ToC4DString(
-						sourceMesh.name
-					) +
-					"\n"
-				);
-
-
-				GePrint(
-					"  Vertex Format : " +
-					UInt32ToString(
-						sourceMesh.vertexFormat
-					) +
-					"\n"
-				);
-
-
 				return false;
 			}
 
@@ -2083,51 +1387,35 @@ namespace GPTDiva
 
 			if (!AddOffset(
 				objectBase,
-				relativeOffset,
+				relativeUVOffset,
 				uvBase))
 			{
 				return false;
 			}
 
 
-			const UInt64 required =
-				(UInt64)uvBase +
-				(UInt64)sourceMesh.vertexCount *
-				8ULL;
+			destinationMesh.texCoords0.reserve(
+				(size_t)sourceMesh.vertexCount
+			);
 
 
-			if (required >
-				(UInt64)reader.Size())
-			{
-				GePrint(
-					"OBJ.BIN UV ERROR : "
-					"TexCoord0 data range is outside OBJ.BIN\n"
-				);
-
-
-				return false;
-			}
-
-
-			try
-			{
-				destinationMesh.texCoords0.reserve(
-					(size_t)sourceMesh.vertexCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			for (UInt32 i = 0;
+			for (Int32 i = 0;
 				i < sourceMesh.vertexCount;
 				++i)
 			{
-				const UInt32 vertexOffset =
-					uvBase +
-					i * 8U;
+				UInt32 offset =
+					0;
+
+
+				if (!AddOffsetMul(
+					uvBase,
+					0U,
+					(UInt32)i,
+					8U,
+					offset))
+				{
+					return false;
+				}
 
 
 				Float32 u =
@@ -2138,68 +1426,1304 @@ namespace GPTDiva
 
 
 				if (!reader.ReadFloat32(
-					vertexOffset + 0,
-					u) ||
-					!reader.ReadFloat32(
-						vertexOffset + 4,
-						v))
+					offset + 0U,
+					u))
 				{
 					return false;
 				}
 
 
-				if (!std::isfinite((double)u) ||
-					!std::isfinite((double)v))
+				if (!reader.ReadFloat32(
+					offset + 4U,
+					v))
 				{
-					GePrint(
-						"OBJ.BIN UV ERROR : "
-						"NaN/Inf detected in Native TexCoord0\n"
-					);
-
-
-					GePrint(
-						"  Mesh : " +
-						ToC4DString(
-							sourceMesh.name
-						) +
-						"\n"
-					);
-
-
-					GePrint(
-						"  Vertex : " +
-						UInt32ToString(
-							i
-						) +
-						"\n"
-					);
-
-
 					return false;
 				}
 
 
-				Vector uv;
-
-
-				uv.x =
-					(Float)u;
-
-				uv.y =
-					(Float)v;
-
-				uv.z =
-					0.0;
+				if (!CheckFloat(u) ||
+					!CheckFloat(v))
+				{
+					return false;
+				}
 
 
 				destinationMesh.texCoords0.push_back(
-					uv
+					Vector(
+					(Float)u,
+						(Float)v,
+						0.0
+					)
 				);
 			}
 
 
-			if (destinationMesh.texCoords0.size() !=
-				(size_t)sourceMesh.vertexCount)
+			return
+				destinationMesh.texCoords0.size() ==
+				(size_t)sourceMesh.vertexCount;
+		}
+
+
+		// ============================================================
+		// SubMesh
+		// ============================================================
+
+		static Bool ParseSubMesh(
+			const BinaryReaderLE& reader,
+			UInt32 objectBase,
+			UInt32 subMeshBase,
+			SubMeshInfo& subMesh)
+		{
+			subMesh =
+				SubMeshInfo();
+
+			subMesh.baseOffset =
+				subMeshBase;
+
+
+			if (!reader.CanRead(
+				subMeshBase,
+				SUBMESH_HEADER_SIZE))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x00U,
+				subMesh.unusedFlags))
+			{
+				return false;
+			}
+
+
+			if (!ReadBoundingSphere(
+				reader,
+				subMeshBase + 0x04U,
+				subMesh.boundingSphere))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x14U,
+				subMesh.materialIndex))
+			{
+				return false;
+			}
+
+
+			for (Int32 i = 0;
+				i < 8;
+				++i)
+			{
+				if (!reader.ReadUChar(
+					subMeshBase +
+					0x18U +
+					(UInt32)i,
+					subMesh.texCoordIndices[i]))
+				{
+					return false;
+				}
+			}
+
+
+			if (!reader.ReadInt32(
+				subMeshBase + 0x20U,
+				subMesh.boneIndexCount))
+			{
+				return false;
+			}
+
+
+			if (subMesh.boneIndexCount < 0)
+				return false;
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x24U,
+				subMesh.boneIndicesOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x28U,
+				subMesh.bonesPerVertex))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x2CU,
+				subMesh.primitiveType))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadInt32(
+				subMeshBase + 0x30U,
+				subMesh.indexFormat))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadInt32(
+				subMeshBase + 0x34U,
+				subMesh.indexCount))
+			{
+				return false;
+			}
+
+
+			if (subMesh.indexCount < 0)
+				return false;
+
+
+			UInt32 storedIndexOffset =
+				0;
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x38U,
+				storedIndexOffset))
+			{
+				return false;
+			}
+
+
+			if (!AddOffset(
+				objectBase,
+				storedIndexOffset,
+				subMesh.indicesOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x3CU,
+				subMesh.flags))
+			{
+				return false;
+			}
+
+
+			subMesh.subMeshFlags =
+				subMesh.flags;
+
+
+			if (!reader.ReadUInt32(
+				subMeshBase + 0x58U,
+				subMesh.indexOffset))
+			{
+				return false;
+			}
+
+
+			if (subMesh.boneIndexCount > 0 &&
+				subMesh.boneIndicesOffset != 0U)
+			{
+				subMesh.boneIndices.reserve(
+					(size_t)subMesh.boneIndexCount
+				);
+
+
+				for (Int32 i = 0;
+					i < subMesh.boneIndexCount;
+					++i)
+				{
+					UInt32 offset =
+						0;
+
+
+					if (!AddOffsetMul(
+						objectBase,
+						subMesh.boneIndicesOffset,
+						(UInt32)i,
+						2U,
+						offset))
+					{
+						return false;
+					}
+
+
+					UInt16 boneIndex =
+						0;
+
+
+					if (!reader.ReadUInt16(
+						offset,
+						boneIndex))
+					{
+						return false;
+					}
+
+
+					subMesh.boneIndices.push_back(
+						(UInt32)boneIndex
+					);
+				}
+			}
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Index
+		// ============================================================
+
+		static Bool ReadIndexAt(
+			const BinaryReaderLE& reader,
+			UInt32 offset,
+			Int32 indexFormat,
+			UInt32& value)
+		{
+			if (indexFormat ==
+				(Int32)INDEX_FORMAT_UINT8)
+			{
+				UChar v =
+					0;
+
+
+				if (!reader.ReadUChar(
+					offset,
+					v))
+				{
+					return false;
+				}
+
+
+				value =
+					(v == 0xFFU)
+					? 0xFFFFFFFFU
+					: (UInt32)v;
+
+
+				return true;
+			}
+
+
+			if (indexFormat ==
+				(Int32)INDEX_FORMAT_UINT16)
+			{
+				UInt16 v =
+					0;
+
+
+				if (!reader.ReadUInt16(
+					offset,
+					v))
+				{
+					return false;
+				}
+
+
+				value =
+					(v == 0xFFFFU)
+					? 0xFFFFFFFFU
+					: (UInt32)v;
+
+
+				return true;
+			}
+
+
+			if (indexFormat ==
+				(Int32)INDEX_FORMAT_UINT32)
+			{
+				return reader.ReadUInt32(
+					offset,
+					value
+				);
+			}
+
+
+			return false;
+		}
+
+
+		static Bool ParseIndices(
+			const BinaryReaderLE& reader,
+			SubMeshInfo& subMesh)
+		{
+			subMesh.indices.clear();
+
+
+			if (subMesh.indexCount == 0)
+				return true;
+
+
+			UInt32 stride =
+				0;
+
+
+			if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT8)
+			{
+				stride =
+					1U;
+			}
+			else if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT16)
+			{
+				stride =
+					2U;
+			}
+			else if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT32)
+			{
+				stride =
+					4U;
+			}
+			else
+			{
+				return false;
+			}
+
+
+			if (subMesh.indicesOffset == 0U)
+				return false;
+
+
+			const UInt64 payloadSize =
+				(UInt64)subMesh.indexCount *
+				(UInt64)stride;
+
+
+			if ((UInt64)subMesh.indicesOffset +
+				payloadSize >
+				0xFFFFFFFFULL)
+			{
+				return false;
+			}
+
+
+			subMesh.indices.reserve(
+				(size_t)subMesh.indexCount
+			);
+
+
+			for (Int32 i = 0;
+				i < subMesh.indexCount;
+				++i)
+			{
+				UInt32 offset =
+					0;
+
+
+				if (!AddOffsetMul(
+					subMesh.indicesOffset,
+					0U,
+					(UInt32)i,
+					stride,
+					offset))
+				{
+					return false;
+				}
+
+
+				UInt32 value =
+					0;
+
+
+				if (!ReadIndexAt(
+					reader,
+					offset,
+					subMesh.indexFormat,
+					value))
+				{
+					return false;
+				}
+
+
+				subMesh.indices.push_back(
+					value
+				);
+			}
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Triangle conversion
+		//
+		// IMPORTANT:
+		//   Do not change this in the current fix.
+		// ============================================================
+
+		static Bool BuildTriangles(
+			const std::vector<UInt32>& indices,
+			UInt32 primitiveType,
+			std::vector<UInt32>& triangles)
+		{
+			triangles.clear();
+
+
+			if (primitiveType ==
+				PRIMITIVE_TRIANGLES)
+			{
+				if ((indices.size() % 3U) != 0U)
+					return false;
+
+
+				triangles =
+					indices;
+
+
+				return true;
+			}
+
+
+			if (primitiveType !=
+				PRIMITIVE_TRIANGLE_STRIP)
+			{
+				return false;
+			}
+
+
+			UInt32 a =
+				0;
+
+			UInt32 b =
+				0;
+
+			Int32 active =
+				0;
+
+			Bool flip =
+				false;
+
+
+			for (size_t i = 0;
+				i < indices.size();
+				++i)
+			{
+				const UInt32 c =
+					indices[i];
+
+
+				if (c ==
+					0xFFFFFFFFU)
+				{
+					active =
+						0;
+
+					flip =
+						false;
+
+					continue;
+				}
+
+
+				if (active == 0)
+				{
+					a =
+						c;
+
+					active =
+						1;
+
+					continue;
+				}
+
+
+				if (active == 1)
+				{
+					b =
+						c;
+
+					active =
+						2;
+
+					continue;
+				}
+
+
+				if (a != b &&
+					b != c &&
+					c != a)
+				{
+					if (!flip)
+					{
+						triangles.push_back(
+							a
+						);
+
+						triangles.push_back(
+							b
+						);
+
+						triangles.push_back(
+							c
+						);
+					}
+					else
+					{
+						triangles.push_back(
+							a
+						);
+
+						triangles.push_back(
+							c
+						);
+
+						triangles.push_back(
+							b
+						);
+					}
+				}
+
+
+				flip =
+					!flip;
+
+
+				a =
+					b;
+
+				b =
+					c;
+			}
+
+
+			return
+				(triangles.size() % 3U) == 0U;
+		}
+
+
+		// ============================================================
+		// Index diagnostic head
+		// ============================================================
+
+		static void PrintIndexHead(
+			const char* label,
+			const std::vector<UInt32>& values,
+			UInt32 maxCount)
+		{
+			if (!label)
+				return;
+
+
+			GePrint(
+				String("[OBJ INDEX DIAG] ") +
+				String(label) +
+				" Count : " +
+				String::IntToString(
+				(Int64)values.size()
+				)
+			);
+
+
+			if (values.empty())
+			{
+				GePrint(
+					String("[OBJ INDEX DIAG] ") +
+					String(label) +
+					" Head : <EMPTY>"
+				);
+
+				return;
+			}
+
+
+			const UInt32 count =
+				(values.size() <
+				(size_t)maxCount)
+				? (UInt32)values.size()
+				: maxCount;
+
+
+			String line =
+				String("[OBJ INDEX DIAG] ") +
+				String(label) +
+				" Head[";
+
+
+			for (UInt32 i = 0;
+				i < count;
+				++i)
+			{
+				if (i > 0U)
+					line +=
+					", ";
+
+
+				line +=
+					String::IntToString(
+					(Int64)values[
+						(size_t)i
+					]
+					);
+			}
+
+
+			line +=
+				"]";
+
+
+			GePrint(
+				line
+			);
+		}
+
+
+		// ============================================================
+		// Index diagnostic
+		// ============================================================
+
+		static void DiagnoseSubMeshIndices(
+			const MeshInfo& mesh,
+			UInt32 objectIndex,
+			UInt32 meshIndex,
+			UInt32 subMeshIndex,
+			const SubMeshInfo& subMesh)
+		{
+			const Bool isTriangles =
+				subMesh.primitiveType ==
+				PRIMITIVE_TRIANGLES;
+
+
+			const Bool isTriangleStrip =
+				subMesh.primitiveType ==
+				PRIMITIVE_TRIANGLE_STRIP;
+
+
+			String primitiveName =
+				String("UNKNOWN");
+
+
+			if (isTriangles)
+			{
+				primitiveName =
+					String("TRIANGLES");
+			}
+			else if (isTriangleStrip)
+			{
+				primitiveName =
+					String("TRIANGLE_STRIP");
+			}
+
+
+			String indexFormatName =
+				String("UNKNOWN");
+
+
+			if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT8)
+			{
+				indexFormatName =
+					String("UINT8");
+			}
+			else if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT16)
+			{
+				indexFormatName =
+					String("UINT16");
+			}
+			else if (subMesh.indexFormat ==
+				(Int32)INDEX_FORMAT_UINT32)
+			{
+				indexFormatName =
+					String("UINT32");
+			}
+
+
+			UInt64 rawMin =
+				0xFFFFFFFFULL;
+
+			UInt64 rawMax =
+				0ULL;
+
+			UInt32 rawSeparatorCount =
+				0U;
+
+			UInt32 rawOutOfRange =
+				0U;
+
+			UInt32 rawDegenerate =
+				0U;
+
+
+			for (size_t i = 0;
+				i < subMesh.indices.size();
+				++i)
+			{
+				const UInt32 index =
+					subMesh.indices[i];
+
+
+				if (index ==
+					0xFFFFFFFFU)
+				{
+					++rawSeparatorCount;
+					continue;
+				}
+
+
+				if ((UInt64)index <
+					rawMin)
+				{
+					rawMin =
+						(UInt64)index;
+				}
+
+
+				if ((UInt64)index >
+					rawMax)
+				{
+					rawMax =
+						(UInt64)index;
+				}
+
+
+				if (index >=
+					(UInt32)mesh.vertexCount)
+				{
+					++rawOutOfRange;
+				}
+			}
+
+
+			for (size_t i = 0;
+				i + 2U <
+				subMesh.indices.size();
+				i += 3U)
+			{
+				const UInt32 a =
+					subMesh.indices[
+						i + 0U
+					];
+
+				const UInt32 b =
+					subMesh.indices[
+						i + 1U
+					];
+
+				const UInt32 c =
+					subMesh.indices[
+						i + 2U
+					];
+
+
+				if (a ==
+					0xFFFFFFFFU ||
+					b ==
+					0xFFFFFFFFU ||
+					c ==
+					0xFFFFFFFFU)
+				{
+					continue;
+				}
+
+
+				if (a == b ||
+					b == c ||
+					c == a)
+				{
+					++rawDegenerate;
+				}
+			}
+
+
+			UInt64 triangleMin =
+				0xFFFFFFFFULL;
+
+			UInt64 triangleMax =
+				0ULL;
+
+			UInt32 triangleOutOfRange =
+				0U;
+
+			UInt32 triangleDegenerate =
+				0U;
+
+
+			for (size_t i = 0;
+				i < subMesh.triangleIndices.size();
+				++i)
+			{
+				const UInt32 index =
+					subMesh.triangleIndices[
+						i
+					];
+
+
+				if ((UInt64)index <
+					triangleMin)
+				{
+					triangleMin =
+						(UInt64)index;
+				}
+
+
+				if ((UInt64)index >
+					triangleMax)
+				{
+					triangleMax =
+						(UInt64)index;
+				}
+
+
+				if (index >=
+					(UInt32)mesh.vertexCount)
+				{
+					++triangleOutOfRange;
+				}
+			}
+
+
+			for (size_t i = 0;
+				i + 2U <
+				subMesh.triangleIndices.size();
+				i += 3U)
+			{
+				const UInt32 a =
+					subMesh.triangleIndices[
+						i + 0U
+					];
+
+				const UInt32 b =
+					subMesh.triangleIndices[
+						i + 1U
+					];
+
+				const UInt32 c =
+					subMesh.triangleIndices[
+						i + 2U
+					];
+
+
+				if (a == b ||
+					b == c ||
+					c == a)
+				{
+					++triangleDegenerate;
+				}
+			}
+
+
+			GePrint(
+				"------------------------------------------------------------"
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Object : " +
+				String::IntToString(
+				(Int64)objectIndex
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Mesh : " +
+				String::IntToString(
+				(Int64)meshIndex
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] SubMesh : " +
+				String::IntToString(
+				(Int64)subMeshIndex
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Mesh VertexCount : " +
+				String::IntToString(
+				(Int64)mesh.vertexCount
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Mesh VertexSize : " +
+				String::IntToString(
+				(Int64)mesh.vertexSize
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] PrimitiveType : " +
+				String::IntToString(
+				(Int64)subMesh.primitiveType
+				) +
+				" (" +
+				primitiveName +
+				")"
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] IndexFormat : " +
+				String::IntToString(
+				(Int64)subMesh.indexFormat
+				) +
+				" (" +
+				indexFormatName +
+				")"
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Declared IndexCount : " +
+				String::IntToString(
+				(Int64)subMesh.indexCount
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Parsed Raw IndexCount : " +
+				String::IntToString(
+				(Int64)subMesh.indices.size()
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Parsed TriangleIndexCount : " +
+				String::IntToString(
+				(Int64)subMesh.triangleIndices.size()
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] TriangleCount : " +
+				String::IntToString(
+				(Int64)subMesh.triangleCount
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Stored Index Offset : " +
+				String::IntToString(
+				(Int64)subMesh.indicesOffset
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Index Offset Field : " +
+				String::IntToString(
+				(Int64)subMesh.indexOffset
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Strip Separator Count : " +
+				String::IntToString(
+				(Int64)rawSeparatorCount
+				)
+			);
+
+
+			if (rawMin ==
+				0xFFFFFFFFULL)
+			{
+				GePrint(
+					"[OBJ INDEX DIAG] Raw Min : <NONE>"
+				);
+			}
+			else
+			{
+				GePrint(
+					"[OBJ INDEX DIAG] Raw Min : " +
+					String::IntToString(
+					(Int64)rawMin
+					)
+				);
+			}
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Raw Max : " +
+				String::IntToString(
+				(Int64)rawMax
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Raw OutOfRange : " +
+				String::IntToString(
+				(Int64)rawOutOfRange
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Raw Degenerate : " +
+				String::IntToString(
+				(Int64)rawDegenerate
+				)
+			);
+
+
+			if (triangleMin ==
+				0xFFFFFFFFULL)
+			{
+				GePrint(
+					"[OBJ INDEX DIAG] Triangle Min : <NONE>"
+				);
+			}
+			else
+			{
+				GePrint(
+					"[OBJ INDEX DIAG] Triangle Min : " +
+					String::IntToString(
+					(Int64)triangleMin
+					)
+				);
+			}
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Triangle Max : " +
+				String::IntToString(
+				(Int64)triangleMax
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Triangle OutOfRange : " +
+				String::IntToString(
+				(Int64)triangleOutOfRange
+				)
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] Triangle Degenerate : " +
+				String::IntToString(
+				(Int64)triangleDegenerate
+				)
+			);
+
+
+			PrintIndexHead(
+				"RAW",
+				subMesh.indices,
+				24U
+			);
+
+
+			PrintIndexHead(
+				"TRIANGLE",
+				subMesh.triangleIndices,
+				24U
+			);
+
+
+			GePrint(
+				"[OBJ INDEX DIAG] STATUS : " +
+				(
+					rawOutOfRange == 0U &&
+					triangleOutOfRange == 0U
+					? String("RANGE OK")
+					: String("!!! OUT OF RANGE !!!")
+					)
+			);
+
+
+			GePrint(
+				"------------------------------------------------------------"
+			);
+		}
+
+
+		// ============================================================
+		// Parse Mesh SubMeshes
+		// ============================================================
+
+		static Bool ParseMeshSubMeshes(
+			const BinaryReaderLE& reader,
+			UInt32 objectBase,
+			MeshInfo& mesh,
+			UInt32 objectIndex,
+			UInt32 meshIndex)
+		{
+			mesh.subMeshes.clear();
+
+
+			if (mesh.subMeshCount == 0)
+				return true;
+
+
+			if (mesh.subMeshesOffset == 0U)
+				return false;
+
+
+			mesh.subMeshes.reserve(
+				(size_t)mesh.subMeshCount
+			);
+
+
+			for (Int32 i = 0;
+				i < mesh.subMeshCount;
+				++i)
+			{
+				UInt32 subMeshBase =
+					0;
+
+
+				if (!AddOffsetMul(
+					objectBase,
+					mesh.subMeshesOffset,
+					(UInt32)i,
+					SUBMESH_HEADER_SIZE,
+					subMeshBase))
+				{
+					return false;
+				}
+
+
+				SubMeshInfo subMesh;
+
+
+				if (!ParseSubMesh(
+					reader,
+					objectBase,
+					subMeshBase,
+					subMesh))
+				{
+					return false;
+				}
+
+
+				if (!ParseIndices(
+					reader,
+					subMesh))
+				{
+					return false;
+				}
+
+
+				for (size_t n = 0;
+					n < subMesh.indices.size();
+					++n)
+				{
+					if (subMesh.indices[n] ==
+						0xFFFFFFFFU)
+					{
+						++subMesh.stripSeparatorCount;
+					}
+				}
+
+
+				if (!BuildTriangles(
+					subMesh.indices,
+					subMesh.primitiveType,
+					subMesh.triangleIndices))
+				{
+					return false;
+				}
+
+
+				subMesh.triangleCount =
+					(Int32)(
+						subMesh.triangleIndices.size() /
+						3U
+						);
+
+
+				DiagnoseSubMeshIndices(
+					mesh,
+					objectIndex,
+					meshIndex,
+					(UInt32)i,
+					subMesh
+				);
+
+
+				mesh.subMeshes.push_back(
+					subMesh
+				);
+			}
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Parse Mesh
+		// ============================================================
+
+		static Bool ParseMesh(
+			const BinaryReaderLE& reader,
+			UInt32 objectBase,
+			UInt32 meshBase,
+			MeshInfo& mesh,
+			UInt32 objectIndex,
+			UInt32 meshIndex)
+		{
+			if (!ParseMeshHeader(
+				reader,
+				meshBase,
+				mesh))
+			{
+				return false;
+			}
+
+
+			// IMPORTANT:
+			// Attribute offsets are Object BaseOffset-relative.
+
+			if (!ParsePositions(
+				reader,
+				objectBase,
+				mesh,
+				mesh))
+			{
+				return false;
+			}
+
+
+			if (!ParseNormals(
+				reader,
+				objectBase,
+				mesh,
+				mesh))
+			{
+				return false;
+			}
+
+
+			if (!ParseUV0(
+				reader,
+				objectBase,
+				mesh,
+				mesh))
+			{
+				return false;
+			}
+
+
+			if (!ParseMeshSubMeshes(
+				reader,
+				objectBase,
+				mesh,
+				objectIndex,
+				meshIndex))
 			{
 				return false;
 			}
@@ -2210,62 +2734,117 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Parse Object Meshes
+		// Parse Object
 		// ============================================================
 
-		static Bool ParseObjectMeshes(
+		static Bool ParseObject(
 			const BinaryReaderLE& reader,
-			ObjectInfo& object)
+			UInt32 tableEntryOffset,
+			UInt32 objectBase,
+			ObjectInfo& object,
+			UInt32 objectIndex)
 		{
-			object.meshes.clear();
+			object =
+				ObjectInfo();
 
 
-			if (object.meshCount == 0)
-			{
-				return true;
-			}
+			object.tableEntryOffset =
+				tableEntryOffset;
 
 
-			if (object.meshCount >
-				MAX_MESH_COUNT)
-			{
-				return false;
-			}
+			object.objectOffset =
+				objectBase;
 
 
-			if (object.meshesOffset == 0)
-			{
-				return false;
-			}
+			object.baseOffset =
+				objectBase;
 
 
-			const UInt64 meshAreaEnd =
-				(UInt64)object.baseOffset +
-				(UInt64)object.meshesOffset +
-				(UInt64)object.meshCount *
-				(UInt64)MESH_HEADER_SIZE;
-
-
-			if (meshAreaEnd >
-				(UInt64)reader.Size())
+			if (!reader.CanRead(
+				objectBase,
+				OBJECT_HEADER_SIZE))
 			{
 				return false;
 			}
 
 
-			try
-			{
-				object.meshes.reserve(
-					(size_t)object.meshCount
-				);
-			}
-			catch (...)
+			if (!reader.ReadUInt32(
+				objectBase + 0x00U,
+				object.signature))
 			{
 				return false;
 			}
 
 
-			for (UInt32 i = 0;
+			if (!reader.ReadUInt32(
+				objectBase + 0x04U,
+				object.unused))
+			{
+				return false;
+			}
+
+
+			if (!ReadBoundingSphere(
+				reader,
+				objectBase + 0x08U,
+				object.boundingSphere))
+			{
+				return false;
+			}
+
+
+			object.boundingSphereCenter =
+				object.boundingSphere.center;
+
+			object.boundingSphereRadius =
+				object.boundingSphere.radius;
+
+
+			if (!reader.ReadInt32(
+				objectBase + 0x18U,
+				object.meshCount))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				objectBase + 0x1CU,
+				object.meshesOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadInt32(
+				objectBase + 0x20U,
+				object.materialCount))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				objectBase + 0x24U,
+				object.materialsOffset))
+			{
+				return false;
+			}
+
+
+			if (object.meshCount < 0 ||
+				object.materialCount < 0)
+			{
+				return false;
+			}
+
+
+			object.meshes.reserve(
+				(size_t)object.meshCount
+			);
+
+
+			for (Int32 i = 0;
 				i < object.meshCount;
 				++i)
 			{
@@ -2274,9 +2853,9 @@ namespace GPTDiva
 
 
 				if (!AddOffsetMul(
-					object.baseOffset,
+					objectBase,
 					object.meshesOffset,
-					i,
+					(UInt32)i,
 					MESH_HEADER_SIZE,
 					meshBase))
 				{
@@ -2289,141 +2868,14 @@ namespace GPTDiva
 
 				if (!ParseMesh(
 					reader,
+					objectBase,
 					meshBase,
-					mesh))
-				{
-					return false;
-				}
-
-
-				if (!ParseMeshSubMeshes(
-					reader,
-					object.baseOffset,
-					mesh))
-				{
-					return false;
-				}
-
-
-				for (UInt32 s = 0;
-					s < (UInt32)mesh.subMeshes.size();
-					++s)
-				{
-					SubMeshInfo& subMesh =
-						mesh.subMeshes[
-							(size_t)s
-						];
-
-
-					if (!ParseIndexPayload(
-						reader,
-						object.baseOffset,
-						subMesh))
-					{
-						return false;
-					}
-
-
-					if (!BuildTriangleIndices(
-						subMesh.indices,
-						subMesh.primitiveType,
-						subMesh.triangleIndices))
-					{
-						GePrint(
-							"OBJ.BIN ERROR : "
-							"TRIANGLE CONVERSION FAILED\n"
-						);
-
-
-						return false;
-					}
-
-
-					subMesh.triangleCount =
-						(UInt32)(
-							subMesh.triangleIndices.size() /
-							3
-							);
-
-
-					subMesh.stripSeparatorCount =
-						0;
-
-
-					for (size_t k = 0;
-						k < subMesh.indices.size();
-						++k)
-					{
-						if (subMesh.indices[k] ==
-							INDEX_RESTART)
-						{
-							++subMesh.stripSeparatorCount;
-						}
-					}
-				}
-
-
-				// ----------------------------------------------------
-				// Position
-				// ----------------------------------------------------
-
-				MeshInfo positionMesh;
-
-
-				if (!ParsePositions(
-					reader,
-					object.baseOffset,
 					mesh,
-					positionMesh))
+					objectIndex,
+					(UInt32)i))
 				{
 					return false;
 				}
-
-
-				mesh.positions =
-					positionMesh.positions;
-
-
-				// ----------------------------------------------------
-				// Native Normal
-				// ----------------------------------------------------
-
-				MeshInfo normalMesh;
-
-
-				if (!ParseNormals(
-					reader,
-					object.baseOffset,
-					mesh,
-					normalMesh))
-				{
-					return false;
-				}
-
-
-				mesh.normals =
-					normalMesh.normals;
-
-
-				// ----------------------------------------------------
-				// Native TexCoord0
-				// ----------------------------------------------------
-
-				MeshInfo uvMesh;
-
-
-				if (!ParseTexCoords0(
-					reader,
-					object.baseOffset,
-					mesh,
-					uvMesh))
-				{
-					return false;
-				}
-
-
-				mesh.texCoords0 =
-					uvMesh.texCoords0;
 
 
 				object.meshes.push_back(
@@ -2432,199 +2884,508 @@ namespace GPTDiva
 			}
 
 
-			return
-				object.meshes.size() ==
-				(size_t)object.meshCount;
+			object.materials.reserve(
+				(size_t)object.materialCount
+			);
+
+
+			for (Int32 i = 0;
+				i < object.materialCount;
+				++i)
+			{
+				UInt32 materialBase =
+					0;
+
+
+				if (!AddOffsetMul(
+					objectBase,
+					object.materialsOffset,
+					(UInt32)i,
+					MATERIAL_BYTE_SIZE,
+					materialBase))
+				{
+					return false;
+				}
+
+
+				MaterialInfo material;
+
+
+				if (!ParseMaterial(
+					reader,
+					materialBase,
+					material))
+				{
+					return false;
+				}
+
+
+				object.materials.push_back(
+					material
+				);
+			}
+
+
+			return true;
 		}
 
 
 		// ============================================================
-		// Object Name
+		// Parse Object Tables
 		// ============================================================
 
-		static Bool ParseObjectName(
+		static Bool ParseObjectTables(
 			const BinaryReaderLE& reader,
-			const ObjectSetInfo& info,
-			UInt32 objectIndex,
-			std::string& name)
+			ObjectSetInfo& info)
 		{
-			name.clear();
-
-
-			if (info.objectNamesOffset == 0)
-			{
+			if (info.objectCount <= 0)
 				return true;
+
+
+			if (info.objectsOffset == 0U)
+				return false;
+
+
+			info.objects.clear();
+
+
+			info.objects.reserve(
+				(size_t)info.objectCount
+			);
+
+
+			for (Int32 i = 0;
+				i < info.objectCount;
+				++i)
+			{
+				UInt32 tableOffset =
+					0;
+
+
+				if (!AddOffsetMul(
+					info.baseOffset,
+					info.objectsOffset,
+					(UInt32)i,
+					4U,
+					tableOffset))
+				{
+					return false;
+				}
+
+
+				UInt32 objectOffset =
+					0;
+
+
+				if (!reader.ReadUInt32(
+					tableOffset,
+					objectOffset))
+				{
+					return false;
+				}
+
+
+				ObjectInfo object;
+
+
+				if (!ParseObject(
+					reader,
+					tableOffset,
+					objectOffset,
+					object,
+					(UInt32)i))
+				{
+					return false;
+				}
+
+
+				info.objects.push_back(
+					object
+				);
 			}
 
 
-			const UInt64 tableValue =
-				(UInt64)info.objectNamesOffset +
-				(UInt64)objectIndex * 4ULL;
+			if (info.objectNamesOffset != 0U)
+			{
+				for (Int32 i = 0;
+					i < info.objectCount;
+					++i)
+				{
+					UInt32 tableOffset =
+						0;
 
 
-			if (tableValue >
-				0xFFFFFFFFULL)
+					if (!AddOffsetMul(
+						info.baseOffset,
+						info.objectNamesOffset,
+						(UInt32)i,
+						4U,
+						tableOffset))
+					{
+						return false;
+					}
+
+
+					UInt32 nameOffset =
+						0;
+
+
+					if (!reader.ReadUInt32(
+						tableOffset,
+						nameOffset))
+					{
+						return false;
+					}
+
+
+					if (nameOffset != 0U)
+					{
+						std::string name;
+
+
+						if (!reader.ReadCString(
+							nameOffset,
+							name))
+						{
+							return false;
+						}
+
+
+						info.objects[
+							(size_t)i
+						].name =
+							name;
+					}
+				}
+			}
+
+
+			if (info.objectIDsOffset != 0U)
+			{
+				for (Int32 i = 0;
+					i < info.objectCount;
+					++i)
+				{
+					UInt32 offset =
+						0;
+
+
+					if (!AddOffsetMul(
+						info.baseOffset,
+						info.objectIDsOffset,
+						(UInt32)i,
+						4U,
+						offset))
+					{
+						return false;
+					}
+
+
+					UInt32 value =
+						0;
+
+
+					if (!reader.ReadUInt32(
+						offset,
+						value))
+					{
+						return false;
+					}
+
+
+					info.objects[
+						(size_t)i
+					].id =
+						value;
+				}
+			}
+
+
+			if (info.objectSkinsOffset != 0U)
+			{
+				for (Int32 i = 0;
+					i < info.objectCount;
+					++i)
+				{
+					UInt32 offset =
+						0;
+
+
+					if (!AddOffsetMul(
+						info.baseOffset,
+						info.objectSkinsOffset,
+						(UInt32)i,
+						4U,
+						offset))
+					{
+						return false;
+					}
+
+
+					UInt32 value =
+						0;
+
+
+					if (!reader.ReadUInt32(
+						offset,
+						value))
+					{
+						return false;
+					}
+
+
+					info.objects[
+						(size_t)i
+					].skinOffset =
+						value;
+				}
+			}
+
+
+			return true;
+		}
+
+
+		// ============================================================
+		// ObjectSet
+		// ============================================================
+
+		static Bool ParseObjectSet(
+			const BinaryReaderLE& reader,
+			ObjectSetInfo& info)
+		{
+			info =
+				ObjectSetInfo();
+
+
+			info.baseOffset =
+				0U;
+
+
+			if (!reader.CanRead(
+				0U,
+				OBJECT_SET_HEADER_SIZE))
 			{
 				return false;
 			}
-
-
-			UInt32 nameOffset =
-				0;
 
 
 			if (!reader.ReadUInt32(
-				(UInt32)tableValue,
-				nameOffset))
+				0x00U,
+				info.signature))
 			{
 				return false;
 			}
 
 
-			if (nameOffset == 0)
-			{
-				return true;
-			}
-
-
-			if (nameOffset >= reader.Size())
+			if (!reader.ReadInt32(
+				0x04U,
+				info.objectCount))
 			{
 				return false;
 			}
 
 
-			const UInt32 remaining =
-				reader.Size() -
-				nameOffset;
+			if (!reader.ReadUInt32(
+				0x08U,
+				info.globalBoneFieldRaw))
+			{
+				return false;
+			}
 
 
-			const UInt32 maxLength =
-				remaining > 512
-				? 512
-				: remaining;
+			if (!reader.ReadUInt32(
+				0x0CU,
+				info.objectsOffset))
+			{
+				return false;
+			}
 
 
-			return reader.ReadFixedString(
-				nameOffset,
-				maxLength,
-				name
-			);
+			if (!reader.ReadUInt32(
+				0x10U,
+				info.objectSkinsOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				0x14U,
+				info.objectNamesOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				0x18U,
+				info.objectIDsOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadUInt32(
+				0x1CU,
+				info.textureIDsOffset))
+			{
+				return false;
+			}
+
+
+			if (!reader.ReadInt32(
+				0x20U,
+				info.textureIDCount))
+			{
+				return false;
+			}
+
+
+			if (info.objectCount < 0 ||
+				info.textureIDCount < 0)
+			{
+				return false;
+			}
+
+
+			if (info.globalBoneFieldRaw ==
+				0x39393939U)
+			{
+				info.globalBoneFieldIsClassicSentinel =
+					true;
+
+				info.globalBoneCount =
+					-1;
+			}
+			else
+			{
+				info.globalBoneFieldIsClassicSentinel =
+					false;
+
+				info.globalBoneCount =
+					(Int32)info.globalBoneFieldRaw;
+			}
+
+
+			if (!ParseObjectTables(
+				reader,
+				info))
+			{
+				return false;
+			}
+
+
+			info.textureIDs.clear();
+
+
+			if (info.textureIDCount > 0)
+			{
+				if (info.textureIDsOffset == 0U)
+					return false;
+
+
+				info.textureIDs.reserve(
+					(size_t)info.textureIDCount
+				);
+
+
+				for (Int32 i = 0;
+					i < info.textureIDCount;
+					++i)
+				{
+					UInt32 offset =
+						0;
+
+
+					if (!AddOffsetMul(
+						info.baseOffset,
+						info.textureIDsOffset,
+						(UInt32)i,
+						4U,
+						offset))
+					{
+						return false;
+					}
+
+
+					UInt32 value =
+						0;
+
+
+					if (!reader.ReadUInt32(
+						offset,
+						value))
+					{
+						return false;
+					}
+
+
+					info.textureIDs.push_back(
+						value
+					);
+				}
+			}
+
+
+			return true;
 		}
 
 
 		// ============================================================
-		// Object ID
-		// ============================================================
-
-		static Bool ParseObjectID(
-			const BinaryReaderLE& reader,
-			const ObjectSetInfo& info,
-			UInt32 objectIndex,
-			UInt32& id)
-		{
-			id =
-				0;
-
-
-			if (info.objectIDsOffset == 0)
-			{
-				return true;
-			}
-
-
-			const UInt64 value =
-				(UInt64)info.objectIDsOffset +
-				(UInt64)objectIndex * 4ULL;
-
-
-			if (value >
-				0xFFFFFFFFULL)
-			{
-				return false;
-			}
-
-
-			return reader.ReadUInt32(
-				(UInt32)value,
-				id
-			);
-		}
-
-
-		// ============================================================
-		// Skin Offset
-		// ============================================================
-
-		static Bool ParseObjectSkinOffset(
-			const BinaryReaderLE& reader,
-			const ObjectSetInfo& info,
-			UInt32 objectIndex,
-			UInt32& skinOffset)
-		{
-			skinOffset =
-				0;
-
-
-			if (info.objectSkinsOffset == 0)
-			{
-				return true;
-			}
-
-
-			const UInt64 value =
-				(UInt64)info.objectSkinsOffset +
-				(UInt64)objectIndex * 4ULL;
-
-
-			if (value >
-				0xFFFFFFFFULL)
-			{
-				return false;
-			}
-
-
-			return reader.ReadUInt32(
-				(UInt32)value,
-				skinOffset
-			);
-		}
-
-
-		// ============================================================
-		// IsObjectEntry
+		// Object entry check
 		// ============================================================
 
 		Bool IsObjectEntry(
 			const std::string& name)
 		{
-			static const char* const
-				SUFFIX =
+			const std::string suffix =
 				"_obj.bin";
 
 
-			if (name.empty())
-			{
-				return false;
-			}
-
-
-			const size_t suffixLength =
-				std::strlen(SUFFIX);
-
-
 			if (name.size() <
-				suffixLength)
+				suffix.size())
 			{
 				return false;
 			}
 
 
-			return
-				name.compare(
-					name.size() - suffixLength,
-					suffixLength,
-					SUFFIX
-				) == 0;
+			const size_t begin =
+				name.size() -
+				suffix.size();
+
+
+			for (size_t i = 0;
+				i < suffix.size();
+				++i)
+			{
+				char a =
+					name[
+						begin + i
+					];
+
+				char b =
+					suffix[i];
+
+
+				if (a >= 'A' &&
+					a <= 'Z')
+				{
+					a =
+						(char)(
+							a -
+							'A' +
+							'a'
+							);
+				}
+
+
+				if (a != b)
+					return false;
+			}
+
+
+			return true;
 		}
 
 
@@ -2645,50 +3406,29 @@ namespace GPTDiva
 				name;
 
 
-			result.dataSize =
-				data.size() >
-				(size_t)0xFFFFFFFFULL
-				? 0xFFFFFFFFU
-				: (UInt32)data.size();
-
-
-			GePrint(
-				"\n"
-				"============================================================\n"
-				"GPT DIVA FARC TOOL : MML OBJECT STRUCTURE ANALYSIS\n"
-				"============================================================\n"
-			);
-
-
-			GePrint(
-				"BUILD : " +
-				ToC4DString(
-					OBJBIN_ANALYZER_BUILD_MARKER
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Entry : " +
-				ToC4DString(name) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Logical Size : " +
-				UInt32ToString(
-					result.dataSize
-				) +
-				"\n"
-			);
-
-
 			if (data.empty())
 			{
+				GePrint(
+					"OBJ.BIN ANALYSIS : EMPTY DATA"
+				);
+
 				return false;
 			}
+
+
+			if (data.size() >
+				(size_t)0xFFFFFFFFULL)
+			{
+				GePrint(
+					"OBJ.BIN ANALYSIS : DATA TOO LARGE"
+				);
+
+				return false;
+			}
+
+
+			result.dataSize =
+				(UInt32)data.size();
 
 
 			BinaryReaderLE reader(
@@ -2696,321 +3436,82 @@ namespace GPTDiva
 			);
 
 
-			// --------------------------------------------------------
-			// ObjectSet
-			// --------------------------------------------------------
+			GePrint(
+				"============================================================"
+			);
 
-			if (!ReadObjectSet(
+
+			GePrint(
+				"GPT DIVA FARC TOOL : OBJ.BIN MML STRUCTURE ANALYSIS"
+			);
+
+
+			GePrint(
+				"============================================================"
+			);
+
+
+			GePrint(
+				"Entry Name : " +
+				String(name.c_str())
+			);
+
+
+			GePrint(
+				"Logical Size : " +
+				String::IntToString(
+				(Int64)data.size()
+				)
+			);
+
+
+			if (!ParseObjectSet(
 				reader,
 				result.objectSet))
 			{
-				return false;
-			}
-
-
-			GePrint(
-				"============================================================\n"
-				"OBJECTSET STRUCTURE\n"
-				"============================================================\n"
-			);
-
-
-			GePrint(
-				"Signature : " +
-				UInt32ToString(
-					result.objectSet.signature
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Object Count : " +
-				UInt32ToString(
-					result.objectSet.objectCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Global Bone Raw : " +
-				UInt32ToString(
-					result.objectSet.globalBoneCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Objects Offset : " +
-				UInt32ToString(
-					result.objectSet.objectsOffset
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Object Skins Offset : " +
-				UInt32ToString(
-					result.objectSet.objectSkinsOffset
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Object Names Offset : " +
-				UInt32ToString(
-					result.objectSet.objectNamesOffset
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Object IDs Offset : " +
-				UInt32ToString(
-					result.objectSet.objectIDsOffset
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Texture IDs Offset : " +
-				UInt32ToString(
-					result.objectSet.textureIDsOffset
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Texture ID Count : " +
-				UInt32ToString(
-					result.objectSet.textureIDCount
-				) +
-				"\n"
-			);
-
-
-			if (!ParseTextureIDs(
-				reader,
-				result.objectSet,
-				result.textureIDs))
-			{
-				return false;
-			}
-
-
-			if (result.objectSet.objectCount == 0)
-			{
-				result.success =
-					true;
-
-
 				GePrint(
-					"ObjectSet : OK\n"
+					"OBJ.BIN ANALYSIS : OBJECTSET PARSE FAILED"
 				);
 
+				return false;
+			}
 
+
+			if (result.objectSet.signature !=
+				OBJECT_SET_SIGNATURE_CLASSIC)
+			{
 				GePrint(
-					"Texture ID Table : OK\n"
+					"OBJ.BIN ANALYSIS : NON-CLASSIC OBJECTSET"
 				);
 
-
-				return true;
-			}
-
-
-			if (result.objectSet.objectCount >
-				MAX_OBJECT_COUNT)
-			{
 				return false;
 			}
 
 
-			const UInt64 objectTableEnd =
-				(UInt64)result.objectSet.objectsOffset +
-				(UInt64)result.objectSet.objectCount *
-				4ULL;
+			result.objects =
+				result.objectSet.objects;
 
 
-			if (objectTableEnd >
-				(UInt64)reader.Size())
-			{
-				return false;
-			}
+			result.textureIDs =
+				result.objectSet.textureIDs;
 
 
-			try
-			{
-				result.objects.reserve(
-					(size_t)result.objectSet.objectCount
-				);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Objects
-			// --------------------------------------------------------
-
-			for (UInt32 i = 0;
-				i < result.objectSet.objectCount;
-				++i)
-			{
-				UInt32 objectTableOffset =
-					0;
-
-
-				if (!AddOffsetMul(
-					0,
-					result.objectSet.objectsOffset,
-					i,
-					4,
-					objectTableOffset))
-				{
-					return false;
-				}
-
-
-				UInt32 objectOffset =
-					0;
-
-
-				if (!reader.ReadUInt32(
-					objectTableOffset,
-					objectOffset))
-				{
-					return false;
-				}
-
-
-				if (objectOffset == 0)
-				{
-					return false;
-				}
-
-
-				ObjectInfo object;
-
-
-				object.tableEntryOffset =
-					objectTableOffset;
-
-
-				if (!ParseObject(
-					reader,
-					objectOffset,
-					object))
-				{
-					return false;
-				}
-
-
-				if (!ParseObjectName(
-					reader,
-					result.objectSet,
-					i,
-					object.name))
-				{
-					return false;
-				}
-
-
-				if (!ParseObjectID(
-					reader,
-					result.objectSet,
-					i,
-					object.id))
-				{
-					return false;
-				}
-
-
-				if (!ParseObjectSkinOffset(
-					reader,
-					result.objectSet,
-					i,
-					object.skinOffset))
-				{
-					return false;
-				}
-
-
-				if (!ParseObjectMeshes(
-					reader,
-					object))
-				{
-					return false;
-				}
-
-
-				result.objects.push_back(
-					object
-				);
-			}
-
-
-			// --------------------------------------------------------
-			// Validation
-			// --------------------------------------------------------
-
-			Bool allPositionsOK =
-				true;
-
-			Bool allNormalsOK =
-				true;
-
-			Bool allUVsOK =
-				true;
-
-			Bool allIndicesOK =
-				true;
-
-			Bool allTrianglesOK =
-				true;
-
-
-			UInt32 totalMeshCount =
+			UInt64 totalMeshes =
 				0;
 
-			UInt32 totalIndexCount =
+			UInt64 totalPoints =
 				0;
 
-			UInt32 totalTriangleIndexCount =
+			UInt64 totalTriangles =
 				0;
 
-			UInt32 totalTriangleCount =
+			UInt64 totalMaterials =
 				0;
 
-			UInt32 totalStripSeparators =
+			UInt64 activeTextureSlots =
 				0;
 
-
-			UInt32 normalAttributeMeshCount =
-				0;
-
-			UInt32 normalMeshCount =
-				0;
-
-			UInt32 totalNormalCount =
-				0;
-
-
-			UInt32 uvAttributeMeshCount =
-				0;
-
-			UInt32 uvMeshCount =
-				0;
-
-			UInt32 totalUVCount =
+			UInt64 uvMeshes =
 				0;
 
 
@@ -3022,6 +3523,14 @@ namespace GPTDiva
 					result.objects[oi];
 
 
+				totalMeshes +=
+					(UInt64)object.meshes.size();
+
+
+				totalMaterials +=
+					(UInt64)object.materials.size();
+
+
 				for (size_t mi = 0;
 					mi < object.meshes.size();
 					++mi)
@@ -3030,64 +3539,15 @@ namespace GPTDiva
 						object.meshes[mi];
 
 
-					++totalMeshCount;
+					totalPoints +=
+						(UInt64)mesh.positions.size();
 
 
-					if ((mesh.vertexFormat &
-						VERTEX_ATTRIBUTE_POSITION) != 0)
+					if (mesh.texCoords0.size() ==
+						(size_t)mesh.vertexCount &&
+						mesh.vertexCount > 0)
 					{
-						if (mesh.positions.size() !=
-							(size_t)mesh.vertexCount)
-						{
-							allPositionsOK =
-								false;
-						}
-					}
-
-
-					if ((mesh.vertexFormat &
-						VERTEX_ATTRIBUTE_NORMAL) != 0)
-					{
-						++normalAttributeMeshCount;
-
-
-						if (mesh.normals.size() !=
-							(size_t)mesh.vertexCount)
-						{
-							allNormalsOK =
-								false;
-						}
-						else
-						{
-							++normalMeshCount;
-						}
-
-
-						totalNormalCount +=
-							(UInt32)mesh.normals.size();
-					}
-
-
-					if ((mesh.vertexFormat &
-						VERTEX_ATTRIBUTE_TEXCOORD0) != 0)
-					{
-						++uvAttributeMeshCount;
-
-
-						if (mesh.texCoords0.size() !=
-							(size_t)mesh.vertexCount)
-						{
-							allUVsOK =
-								false;
-						}
-						else
-						{
-							++uvMeshCount;
-						}
-
-
-						totalUVCount +=
-							(UInt32)mesh.texCoords0.size();
+						++uvMeshes;
 					}
 
 
@@ -3095,334 +3555,175 @@ namespace GPTDiva
 						si < mesh.subMeshes.size();
 						++si)
 					{
-						const SubMeshInfo& subMesh =
-							mesh.subMeshes[si];
+						totalTriangles +=
+							(UInt64)
+							mesh.subMeshes[si]
+							.triangleCount;
+					}
+				}
 
 
-						if (subMesh.indices.size() !=
-							(size_t)subMesh.indexCount)
+				for (size_t mi = 0;
+					mi < object.materials.size();
+					++mi)
+				{
+					const MaterialInfo& material =
+						object.materials[mi];
+
+
+					for (size_t ti = 0;
+						ti < material.textures.size();
+						++ti)
+					{
+						if (material.textures[ti].type !=
+							MATERIAL_TEXTURE_TYPE_NONE)
 						{
-							allIndicesOK =
-								false;
-						}
-
-
-						if ((subMesh.triangleIndices.size() % 3) != 0)
-						{
-							allTrianglesOK =
-								false;
-						}
-
-
-						totalIndexCount +=
-							(UInt32)subMesh.indices.size();
-
-
-						totalTriangleIndexCount +=
-							(UInt32)subMesh.triangleIndices.size();
-
-
-						totalTriangleCount +=
-							(UInt32)(
-								subMesh.triangleIndices.size() /
-								3
-								);
-
-
-						for (size_t k = 0;
-							k < subMesh.indices.size();
-							++k)
-						{
-							if (subMesh.indices[k] ==
-								INDEX_RESTART)
-							{
-								++totalStripSeparators;
-							}
+							++activeTextureSlots;
 						}
 					}
 				}
 			}
 
 
-			result.success =
-				allPositionsOK &&
-				allNormalsOK &&
-				allUVsOK &&
-				allIndicesOK &&
-				allTrianglesOK;
-
-
-			// ========================================================
-			// Final log
-			// ========================================================
-
 			GePrint(
-				"============================================================\n"
-				"OBJ.BIN MML STRUCTURE ANALYSIS\n"
-				"============================================================\n"
-			);
-
-
-			GePrint(
-				"ObjectSet : OK\n"
+				"ObjectSet : OK"
 			);
 
 
 			GePrint(
 				"Texture ID Table : " +
-				UInt32ToString(
-				(UInt32)result.textureIDs.size()
+				String::IntToString(
+				(Int64)result.textureIDs.size()
+				)
+			);
+
+
+			GePrint(
+				"Object : OK"
+			);
+
+
+			GePrint(
+				"Mesh : OK"
+			);
+
+
+			GePrint(
+				"SubMesh : OK"
+			);
+
+
+			GePrint(
+				"Position : OK"
+			);
+
+
+			GePrint(
+				"Normal : OK / RAW"
+			);
+
+
+			GePrint(
+				"UV0 : " +
+				String::IntToString(
+				(Int64)uvMeshes
 				) +
-				" / " +
-				UInt32ToString(
-					result.objectSet.textureIDCount
-				) +
-				"\n"
+				" mesh(es)"
 			);
 
 
 			GePrint(
-				"Object : OK\n"
+				"Material : OK"
 			);
 
 
 			GePrint(
-				"Mesh : OK\n"
+				"Material Texture Metadata : OK"
 			);
 
 
 			GePrint(
-				"Total Mesh Count : " +
-				UInt32ToString(
-					totalMeshCount
-				) +
-				"\n"
+				"Texture Payload : NOT PARSED YET"
 			);
 
 
 			GePrint(
-				"Index Payload : "
+				"Skin : OFFSET ONLY"
 			);
 
 
 			GePrint(
-				allIndicesOK
-				? "OK\n"
-				: "CHECK REQUIRED\n"
+				"Bone : NOT PARSED YET"
 			);
 
 
 			GePrint(
-				"Total Parsed Indices : " +
-				UInt32ToString(
-					totalIndexCount
-				) +
-				"\n"
+				"EX Data : NOT PARSED YET"
 			);
 
 
 			GePrint(
-				"Total Strip Separators : " +
-				UInt32ToString(
-					totalStripSeparators
-				) +
-				"\n"
+				"Mesh Count : " +
+				String::IntToString(
+				(Int64)totalMeshes
+				)
 			);
 
 
 			GePrint(
-				"Triangle Conversion : "
+				"Point Count : " +
+				String::IntToString(
+				(Int64)totalPoints
+				)
 			);
 
 
 			GePrint(
-				allTrianglesOK
-				? "OK\n"
-				: "CHECK REQUIRED\n"
+				"Triangle Count : " +
+				String::IntToString(
+				(Int64)totalTriangles
+				)
 			);
 
 
 			GePrint(
-				"Total Triangle Indices : " +
-				UInt32ToString(
-					totalTriangleIndexCount
-				) +
-				"\n"
+				"Material Count : " +
+				String::IntToString(
+				(Int64)totalMaterials
+				)
 			);
 
 
 			GePrint(
-				"Total Triangles : " +
-				UInt32ToString(
-					totalTriangleCount
-				) +
-				"\n"
+				"Active Texture Slots : " +
+				String::IntToString(
+				(Int64)activeTextureSlots
+				)
 			);
 
 
 			GePrint(
-				"Position : "
+				"============================================================"
 			);
 
 
 			GePrint(
-				allPositionsOK
-				? "OK\n"
-				: "CHECK REQUIRED\n"
+				"OBJ.BIN ANALYSIS : SUCCESS"
 			);
 
 
 			GePrint(
-				"Normal Attribute Meshes : " +
-				UInt32ToString(
-					normalAttributeMeshCount
-				) +
-				" / " +
-				UInt32ToString(
-					totalMeshCount
-				) +
-				"\n"
+				"============================================================"
 			);
 
 
-			GePrint(
-				"Parsed Normal Meshes : " +
-				UInt32ToString(
-					normalMeshCount
-				) +
-				"\n"
-			);
+			result.success =
+				true;
 
 
-			GePrint(
-				"Parsed Native Normal Count : " +
-				UInt32ToString(
-					totalNormalCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Normal : "
-			);
-
-
-			GePrint(
-				allNormalsOK
-				? "OK\n"
-				: "CHECK REQUIRED\n"
-			);
-
-
-			GePrint(
-				"UV Attribute Meshes : " +
-				UInt32ToString(
-					uvAttributeMeshCount
-				) +
-				" / " +
-				UInt32ToString(
-					totalMeshCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Parsed Native UV Meshes : " +
-				UInt32ToString(
-					uvMeshCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"Parsed Native UV Count : " +
-				UInt32ToString(
-					totalUVCount
-				) +
-				"\n"
-			);
-
-
-			GePrint(
-				"UV Coordinate : Native U,V\n"
-			);
-
-
-			GePrint(
-				"UV Conversion : NONE\n"
-			);
-
-
-			GePrint(
-				"UV : "
-			);
-
-
-			GePrint(
-				allUVsOK
-				? "OK\n"
-				: "CHECK REQUIRED\n"
-			);
-
-
-			GePrint(
-				"Material : NOT PARSED YET\n"
-			);
-
-
-			GePrint(
-				"Texture : NOT PARSED YET\n"
-			);
-
-
-			GePrint(
-				"Skin : OFFSET ONLY\n"
-			);
-
-
-			GePrint(
-				"Bone : NOT PARSED YET\n"
-			);
-
-
-			GePrint(
-				"EX Data : NOT PARSED YET\n"
-			);
-
-
-			GePrint(
-				"SubMesh BoneIndices : PARSED\n"
-			);
-
-
-			GePrint(
-				"PolygonObject : NOT CREATED YET\n"
-			);
-
-
-			GePrint(
-				"============================================================\n"
-			);
-
-
-			GePrint(
-				result.success
-				? "OBJ.BIN ANALYSIS : SUCCESS\n"
-				: "OBJ.BIN ANALYSIS : FAILED\n"
-			);
-
-
-			GePrint(
-				"============================================================\n"
-			);
-
-
-			return result.success;
+			return true;
 		}
+
 
 	}
 }
-

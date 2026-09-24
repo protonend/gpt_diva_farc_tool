@@ -1,46 +1,44 @@
-// File : ObjBinUVBuilder.h
+
+// File : ObjBinUvBuilder.h
 // Project : GPT DIVA FARC TOOL
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   ObjBinAnalyzer が解析済みの Native UV を
-//   Cinema 4D R19 の UVWTag へ接続する。
-// 
-//   OBJ.BIN の再解析は行わない。
-//   FARC / GZip / ObjectSet / Mesh / SubMesh の解析は
-//   ObjBinAnalyzer 側が担当する。
+//   OBJ.BIN Analyzer が取得した Native UV0 を
+//   Cinema 4D R19 の UVWTag に接続する。
 //
-// Native UV:
-//   U
-//   V
+// MikuMikuLibrary / Classic Mesh 基準:
+//   TexCoord0 = Vertex Attribute bit 4
+//   attributeOffsets[4]
+//   1 vertex = Float32 U + Float32 V
 //
-// C4D:
-//   UVWStruct
-//     a
-//     b
-//     c
-//     d
+// 接続:
+//   MeshInfo::texCoords0
+//       -> PolygonObject Point Index
+//       -> UVWTag
 //
-// 現段階:
-//   Native U,V をそのまま使用する。
-//   U/V反転なし。
-//   0～1への正規化なし。
-//   スケール変更なし。
+// UV値:
+//   U : 変更しない
+//   V : 変更しない
+//   反転 : しない
+//   正規化 : しない
+//   スケール : しない
 //
-// Triangle:
-//   C4D PolygonBuilder と同じ順序を使用する。
+// Polygon:
+//   C4D PolygonObject に既に生成された Polygon の
+//   point index を使用する。
 //
 // 今回やらないこと:
 //   Material
 //   Texture
-//   Skin
+//   UV変換行列
+//   Texture Coordinate Index の複数UV対応
 //   Bone
-//   Morph
-//   EX Data
-//   UV再解析
+//   Skin
 //
 // 次段階:
-//   Material / Texture 接続。
+//   C4D R19でUVWTag生成結果を確認する。
+//   11 Mesh / 11834 UV / 16858 Polygonを基準に検証。
 //
 // ============================================================
 
@@ -51,7 +49,6 @@
 #include "ObjBinAnalyzer.h"
 
 #include <vector>
-
 
 namespace GPTDiva
 {
@@ -67,55 +64,32 @@ namespace GPTDiva
 			Bool success;
 
 			Int32 meshCount;
-
 			Int32 uvMeshCount;
 
-			Int32 uvVertexCount;
-
+			Int32 nativeUvVertexCount;
 			Int32 uvPolygonCount;
 
+			Int32 invalidPointIndexCount;
 			Int32 invalidUvCount;
 
+			Int32 uvwTagCount;
 
 			UvBuildResult()
 				: success(false)
 				, meshCount(0)
 				, uvMeshCount(0)
-				, uvVertexCount(0)
+				, nativeUvVertexCount(0)
 				, uvPolygonCount(0)
+				, invalidPointIndexCount(0)
 				, invalidUvCount(0)
+				, uvwTagCount(0)
 			{
 			}
 		};
 
 
 		// ============================================================
-		// UV Verify Result
-		// ============================================================
-
-		struct UvVerifyResult
-		{
-			Bool success;
-
-			Int32 polygonCount;
-
-			Int32 validPolygonCount;
-
-			Int32 invalidUvCount;
-
-
-			UvVerifyResult()
-				: success(false)
-				, polygonCount(0)
-				, validPolygonCount(0)
-				, invalidUvCount(0)
-			{
-			}
-		};
-
-
-		// ============================================================
-		// Build UVW Tags
+		// Build UV Tags
 		// ============================================================
 
 		Bool BuildUvTags(
@@ -124,17 +98,8 @@ namespace GPTDiva
 			UvBuildResult& result
 		);
 
-
-		// ============================================================
-		// Verify UVW Tags
-		// ============================================================
-
-		Bool VerifyUvTags(
-			const std::vector<PolygonObject*>& meshObjects,
-			UvVerifyResult& result
-		);
-
 	}
 }
 
 #endif
+

@@ -3,101 +3,101 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   MikuMikuLibrary の TextureSet.cs / Texture.cs / SubTexture.cs / TextureFormat.cs
-//   を基準として、TEX.BIN の TXP Type 3 / Type 4 / Type 5 / Type 2
-//   を C4D R19 / VS2015 C++ へ移植するためのネイティブ解析用ヘッダ。
+//   MikuMikuLibrary の TextureSet / Texture / SubTexture 構造に
+//   合わせて TEX.BIN を解析するための共通データ構造。
 //
-//   解析構造:
-//
-//     TEX.BIN
-//       ↓
-//     TXP Type 3
-//       ↓
+//   MikuMikuLibrary:
 //     TextureSet
-//       ↓
-//     Texture Type 4 / 5
-//       ↓
-//     SubTexture Type 2
-//       ↓
-//     Width / Height / Format / ID / Data
+//       TXP type 3
+//       Texture Count
+//       Texture Offset Table
 //
-//   Texture の Data は現段階ではデコードせず raw bytes のまま保持する。
+//     Texture
+//       TXP type 4 / 5
+//       SubTexture Count
+//       MipMap / Array 情報
+//       SubTexture Offset Table
+//
+//     SubTexture
+//       TXP type 2
+//       Width
+//       Height
+//       TextureFormat
+//       ID
+//       DataSize
+//       Raw Data
 //
 // Stage:
-//   TEX.BIN Native Structure Analysis
+//   TEX.BIN
+//     -> TextureSet
+//     -> Texture
+//     -> SubTexture
+//     -> Raw Texture Payload
 //
 // 今回やらないこと:
-//   - C4D Material
-//   - C4D Bitmap
-//   - TextureTag
-//   - UV接続
-//   - DXT / ATI / BC7 decode
-//   - YCbCr decode
-//   - Material Texture Slot接続
+//   C4D Material への接続
+//   Bitmap Shader生成
+//   DXT / ATI / BC7 デコード
+//   Alpha変換
+//   UV接続
+//   Material Channel 接続
 //
 // 次段階:
-//   rinitm8025_tex.bin 全Textureの構造検証
-//   ↓
-//   SubTexture / Format別の実データ検証
-//   ↓
-//   Texture decode
+//   実際に解析された TextureFormat / Payload を確認した後、
+//   MikuMikuModel -> FBX -> C4D R19 の結果に合わせて
+//   Texture画像をC4D側へ接続する。
 //
+// ============================================================
 
-#ifndef GPT_DIVA_FARC_TEX_BIN_ANALYZER_H__
-#define GPT_DIVA_FARC_TEX_BIN_ANALYZER_H__
+#ifndef GPT_DIVA_FARC_TOOL_TEX_BIN_ANALYZER_H__
+#define GPT_DIVA_FARC_TOOL_TEX_BIN_ANALYZER_H__
 
 #include "c4d.h"
 
-#include <vector>
 #include <string>
-#include <cstddef>
-#include <stdint.h>
+#include <vector>
 
-typedef unsigned char  UInt8;
-typedef unsigned short UInt16;
-typedef unsigned int   UInt32;
-
-typedef signed char  Int8;
-typedef signed short Int16;
-typedef signed int   Int32;
-
-
-// ============================================================
-// GPT DIVA
-// ============================================================
 
 namespace GPTDiva
 {
 	namespace TexBin
 	{
-		// ========================================================
-		// TEX.BIN signatures
+
+		// ============================================================
+		// TEX.BIN / TXP signatures
 		//
-		// MikuMikuLibrary:
+		// MikuMikuLibrary TextureSet.cs
+		//   TXP type 3
 		//
-		// TextureSet  = 0x03505854
-		// Texture     = 0x04505854 / 0x05505854
-		// SubTexture  = 0x02505854
-		// ========================================================
-
-		static const UInt32 TEXSET_SIGNATURE =
-			0x03505854u;
-
-		static const UInt32 TEXTURE_SIGNATURE_TYPE4 =
-			0x04505854u;
-
-		static const UInt32 TEXTURE_SIGNATURE_TYPE5 =
-			0x05505854u;
-
-		static const UInt32 SUBTEXTURE_SIGNATURE =
-			0x02505854u;
-
-
-		// ========================================================
-		// Texture Format
+		// MikuMikuLibrary Texture.cs
+		//   TXP type 4 / 5
 		//
-		// MikuMikuLibrary TextureFormat.cs と同じ値。
-		// ========================================================
+		// MikuMikuLibrary SubTexture.cs
+		//   TXP type 2
+		// ============================================================
+
+		static const UInt32
+			TXP_SIGNATURE_TYPE_2 =
+			0x02505854U;
+
+		static const UInt32
+			TXP_SIGNATURE_TYPE_3 =
+			0x03505854U;
+
+		static const UInt32
+			TXP_SIGNATURE_TYPE_4 =
+			0x04505854U;
+
+		static const UInt32
+			TXP_SIGNATURE_TYPE_5 =
+			0x05505854U;
+
+
+		// ============================================================
+		// TextureFormat
+		//
+		// MikuMikuLibrary.Textures.TextureFormat
+		// ============================================================
 
 		enum TextureFormat
 		{
@@ -109,277 +109,186 @@ namespace GPTDiva
 			TEXTURE_FORMAT_RGB5 = 3,
 			TEXTURE_FORMAT_RGB5A1 = 4,
 			TEXTURE_FORMAT_RGBA4 = 5,
-
 			TEXTURE_FORMAT_DXT1 = 6,
 			TEXTURE_FORMAT_DXT1A = 7,
 			TEXTURE_FORMAT_DXT3 = 8,
 			TEXTURE_FORMAT_DXT5 = 9,
-
 			TEXTURE_FORMAT_ATI1 = 10,
 			TEXTURE_FORMAT_ATI2 = 11,
-
 			TEXTURE_FORMAT_L8 = 12,
 			TEXTURE_FORMAT_L8A8 = 13,
-
-			// 14 is not defined by MikuMikuLibrary.
 			TEXTURE_FORMAT_BC7 = 15,
-
 			TEXTURE_FORMAT_BC6H = 127
 		};
 
 
-		// ========================================================
+		// ============================================================
 		// SubTexture
-		// ========================================================
+		// ============================================================
 
 		struct SubTextureInfo
 		{
-			// Position of the SubTexture header in TEX.BIN.
-			UInt32 baseOffset;
+			Bool valid;
 
-			// Original Type 2 signature.
+			UInt32 offset;
+
 			UInt32 signature;
 
-			// Width / Height.
 			Int32 width;
 			Int32 height;
 
-			// TextureFormat enum value.
 			Int32 format;
 
-			// ID field stored in the binary.
-			//
-			// MikuMikuLibrary reads this field and skips it.
-			// We retain it because this importer aims to preserve
-			// as much native information as possible.
 			UInt32 id;
 
-			// Size of raw texture data.
 			UInt32 dataSize;
 
-			// Raw texture data.
-			std::vector<UInt8> data;
+			UInt32 dataOffset;
 
-			// Parser validity.
-			Bool valid;
+			std::vector<unsigned char> data;
+
 
 			SubTextureInfo()
-				: baseOffset(0),
-				signature(0),
-				width(0),
-				height(0),
-				format(TEXTURE_FORMAT_UNKNOWN),
-				id(0),
-				dataSize(0),
-				valid(false)
+				: valid(false)
+				, offset(0)
+				, signature(0)
+				, width(0)
+				, height(0)
+				, format(TEXTURE_FORMAT_UNKNOWN)
+				, id(0)
+				, dataSize(0)
+				, dataOffset(0)
+				, data()
 			{
 			}
 		};
 
 
-		// ========================================================
+		// ============================================================
 		// Texture
-		// ========================================================
+		// ============================================================
 
 		struct TextureInfo
 		{
-			// Position of the Texture Type 4/5 header.
-			UInt32 baseOffset;
+			Bool valid;
 
-			// Type 4 or Type 5 signature.
+			UInt32 offset;
+
 			UInt32 signature;
 
-			// Header field.
 			UInt32 subTextureCount;
 
-			// Header info field.
 			UInt32 info;
 
-			// Decoded from info:
-			//
-			//   mipMapCount = info & 0xFF
-			//   arraySize   = (info >> 8) & 0xFF
-			//
 			UInt32 mipMapCount;
-			UInt32 arraySize;
 
-			Bool usesArraySize;
-			Bool usesMipMaps;
+			UInt32 arraySize;
 
 			std::vector<SubTextureInfo> subTextures;
 
-			Bool valid;
 
 			TextureInfo()
-				: baseOffset(0),
-				signature(0),
-				subTextureCount(0),
-				info(0),
-				mipMapCount(0),
-				arraySize(0),
-				usesArraySize(false),
-				usesMipMaps(false),
-				valid(false)
+				: valid(false)
+				, offset(0)
+				, signature(0)
+				, subTextureCount(0)
+				, info(0)
+				, mipMapCount(0)
+				, arraySize(0)
+				, subTextures()
 			{
 			}
 		};
 
 
-		// ========================================================
-		// TextureSet Analysis Result
-		// ========================================================
+		// ============================================================
+		// TextureSet
+		// ============================================================
 
-		struct TextureSetAnalysisResult
+		struct AnalysisResult
 		{
 			Bool success;
 
-			// Root TXP Type 3 signature.
 			UInt32 signature;
 
-			// TextureSet header values.
 			UInt32 textureCount;
+
 			UInt32 textureCountWithRubbish;
 
-			// Endianness selected by TextureSet::Read().
-			Bool bigEndian;
+			UInt32 textureOffsetTableOffset;
 
-			// Size of the logical TEX.BIN data.
-			UInt32 logicalSize;
+			std::vector<UInt32> textureOffsets;
 
-			// Successfully parsed textures.
-			UInt32 parsedTextureCount;
-
-			// Successfully parsed SubTextures.
-			UInt32 parsedSubTextureCount;
-
-			// Sum of all raw SubTexture data sizes.
-			UInt64 totalTextureDataBytes;
-
-			// Parsed Texture list.
 			std::vector<TextureInfo> textures;
 
-			TextureSetAnalysisResult()
-				: success(false),
-				signature(0),
-				textureCount(0),
-				textureCountWithRubbish(0),
-				bigEndian(false),
-				logicalSize(0),
-				parsedTextureCount(0),
-				parsedSubTextureCount(0),
-				totalTextureDataBytes(0)
+			UInt32 validTextureCount;
+
+			UInt32 validSubTextureCount;
+
+			UInt64 totalPayloadBytes;
+
+			UInt32 invalidTextureCount;
+
+			UInt32 invalidSubTextureCount;
+
+
+			AnalysisResult()
+				: success(false)
+				, signature(0)
+				, textureCount(0)
+				, textureCountWithRubbish(0)
+				, textureOffsetTableOffset(12)
+				, textureOffsets()
+				, textures()
+				, validTextureCount(0)
+				, validSubTextureCount(0)
+				, totalPayloadBytes(0)
+				, invalidTextureCount(0)
+				, invalidSubTextureCount(0)
 			{
 			}
 		};
 
 
-		// ========================================================
-		// Analyzer
-		// ========================================================
+		// ============================================================
+		// API
+		// ============================================================
 
-		class TexBinAnalyzer
-		{
-		public:
-
-			static Bool Analyze(
-				const std::vector<UInt8>& data,
-				TextureSetAnalysisResult& result
-			);
+		Bool Analyze(
+			const std::vector<unsigned char>& data,
+			AnalysisResult& result
+		);
 
 
-		private:
-
-			// ----------------------------------------------------
-			// Primitive readers
-			// ----------------------------------------------------
-
-			static Bool ReadUInt32(
-				const std::vector<UInt8>& data,
-				UInt32 offset,
-				Bool bigEndian,
-				UInt32& value
-			);
-
-			static Bool ReadInt32(
-				const std::vector<UInt8>& data,
-				UInt32 offset,
-				Bool bigEndian,
-				Int32& value
-			);
-
-			static Bool ReadBytes(
-				const std::vector<UInt8>& data,
-				UInt32 offset,
-				UInt32 size,
-				std::vector<UInt8>& output
-			);
+		const char* GetTextureFormatName(
+			Int32 format
+		);
 
 
-			// ----------------------------------------------------
-			// Safe offset
-			// ----------------------------------------------------
-
-			static Bool AddOffset(
-				UInt32 base,
-				UInt32 relative,
-				UInt32 dataSize,
-				UInt32& absolute
-			);
+		Bool IsBlockCompressed(
+			Int32 format
+		);
 
 
-			// ----------------------------------------------------
-			// TEX.BIN parser
-			// ----------------------------------------------------
-
-			static Bool ParseTextureSet(
-				const std::vector<UInt8>& data,
-				Bool bigEndian,
-				TextureSetAnalysisResult& result
-			);
-
-			static Bool ParseTexture(
-				const std::vector<UInt8>& data,
-				UInt32 textureOffset,
-				Bool bigEndian,
-				TextureInfo& texture,
-				UInt32 textureIndex,
-				TextureSetAnalysisResult& result
-			);
-
-			static Bool ParseSubTexture(
-				const std::vector<UInt8>& data,
-				UInt32 subTextureOffset,
-				Bool bigEndian,
-				SubTextureInfo& subTexture,
-				UInt32 textureIndex,
-				UInt32 subTextureIndex
-			);
+		Bool HasAlpha(
+			Int32 format
+		);
 
 
-			// ----------------------------------------------------
-			// Display
-			// ----------------------------------------------------
+		UInt32 GetBlockSize(
+			Int32 format
+		);
 
-			static const char* GetTextureFormatName(
-				Int32 format
-			);
 
-			static void PrintHeader(
-				const TextureSetAnalysisResult& result
-			);
+		UInt64 CalculateExpectedDataSize(
+			Int32 width,
+			Int32 height,
+			Int32 format
+		);
 
-			static void PrintTexture(
-				const TextureInfo& texture,
-				UInt32 textureIndex
-			);
 
-			static void PrintSubTexture(
-				const SubTextureInfo& subTexture,
-				UInt32 textureIndex,
-				UInt32 subTextureIndex
-			);
-		};
-	}
-}
+	} // namespace TexBin
+} // namespace GPTDiva
 
-#endif
+
+#endif // GPT_DIVA_FARC_TOOL_TEX_BIN_ANALYZER_H__

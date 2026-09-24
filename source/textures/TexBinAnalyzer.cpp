@@ -3,125 +3,205 @@
 // Target : Cinema 4D R19 / Visual Studio 2015
 //
 // 内容:
-//   MikuMikuLibrary の TextureSet.cs / Texture.cs / SubTexture.cs /
-//   TextureFormat.cs を基準として TEX.BIN を解析する。
-// 
-//   解析順:
+//   MikuMikuLibrary の TextureSet / Texture / SubTexture
+//   の実装に合わせて TEX.BIN を解析する。
 //
-//     TEX.BIN
-//       ↓
-//     TXP Type 3
-//       ↓
-//     TextureSet
-//       ↓
-//     Texture Type 4 / 5
-//       ↓
-//     SubTexture Type 2
-//       ↓
-//     Width / Height / Format / ID / Data
+//   このStageでは画像をデコードせず、
+//   Texture Payload の実データ範囲を検証する。
 //
-//   Texture Data は現段階ではデコードせず raw bytes のまま保持する。
+//   今回追加:
+//     - Payload Range 再検証
+//     - DATA SIZE / EXPECTED DATA SIZE 比較
+//     - Payload 先頭16byte診断
+//     - SubTexture Payload 検証結果表示
 //
 // Stage:
-//   TEX.BIN Native Structure Analysis
+//   TEX.BIN
+//     -> TextureSet
+//     -> Texture
+//     -> SubTexture
+//     -> Raw Payload
+//     -> Payload Validation
 //
 // 今回やらないこと:
-//   - C4D Material
-//   - C4D Bitmap
-//   - TextureTag
-//   - UV接続
-//   - DXT / ATI / BC7 decode
-//   - YCbCr decode
-//   - Material Texture Slot接続
+//   C4D Material接続
+//   Bitmap Shader
+//   DXT / ATI / BC7 decode
+//   Alpha変換
+//   UV
+//   Texture Transform
 //
 // 次段階:
-//   rinitm8025_tex.bin 全Textureの構造検証
-//   ↓
-//   SubTexture / Format別の実データ検証
-//   ↓
-//   Texture decode
+//   MikuMikuLibrary の TextureFormat 実装確認後、
+//   Format別画像デコードへ進む。
 //
+// ============================================================
 
 #include "TexBinAnalyzer.h"
 
-#include <algorithm>
-#include <limits>
+#include <cstring>
 
 
 namespace GPTDiva
 {
 	namespace TexBin
 	{
+
 		// ============================================================
-		// Read UInt32
+		// Build marker
 		// ============================================================
 
-		Bool TexBinAnalyzer::ReadUInt32(
-			const std::vector<UInt8>& data,
-			UInt32 offset,
-			Bool bigEndian,
-			UInt32& value
-		)
+		static const char* const
+			TEXBIN_ANALYZER_BUILD_MARKER =
+			"GPT_DIVA_FARC_TEXBIN_ANALYZER_STAGE2_PAYLOAD_VERIFY_20260921";
+
+
+		// ============================================================
+		// Safety limits
+		// ============================================================
+
+		static const UInt32
+			MAX_TEXTURE_COUNT =
+			1000000U;
+
+
+		static const UInt32
+			MAX_SUBTEXTURE_COUNT =
+			1000000U;
+
+
+		static const UInt64
+			MAX_SINGLE_PAYLOAD_SIZE =
+			1024ULL * 1024ULL * 1024ULL;
+
+
+		// ============================================================
+		// C4D R19 数値文字列
+		// ============================================================
+
+		static String UInt32ToHexString(
+			UInt32 value)
 		{
-			value = 0;
+			static const char* const digits =
+				"0123456789ABCDEF";
 
-			if ((UInt64)offset + 4ULL >
-				(UInt64)data.size())
+			char buffer[11];
+
+			buffer[0] = '0';
+			buffer[1] = 'x';
+
+			for (Int32 i = 0; i < 8; ++i)
 			{
+				const Int32 shift =
+					(7 - i) * 4;
+
+				buffer[2 + i] =
+					digits[
+						(value >> shift) & 0x0F
+					];
+			}
+
+			buffer[10] = '\0';
+
+			return String(buffer);
+		}
+
+
+		// ============================================================
+		// UInt8 -> Hex
+		// ============================================================
+
+		static char UInt8ToHex(
+			unsigned char value)
+		{
+			static const char* const digits =
+				"0123456789ABCDEF";
+
+			return digits[value & 0x0F];
+		}
+
+
+		// ============================================================
+		// Payload先頭16byte表示
+		//
+		// 画像デコードはしない。
+		// 単純に実Payloadが正しい位置から取得されているか
+		// 確認するためだけに使用する。
+		// ============================================================
+
+		static String PayloadHeadToString(
+			const std::vector<unsigned char>& data)
+		{
+			String result;
+
+			const size_t count =
+				data.size() < 16
+				? data.size()
+				: 16;
+
+			for (size_t i = 0; i < count; ++i)
+			{
+				const unsigned char value =
+					data[i];
+
+				const char hi =
+					UInt8ToHex(
+					(unsigned char)(value >> 4));
+
+				const char lo =
+					UInt8ToHex(
+						value);
+
+				char buffer[4];
+
+				buffer[0] = hi;
+				buffer[1] = lo;
+				buffer[2] = ' ';
+				buffer[3] = '\0';
+
+				result +=
+					String(buffer);
+			}
+
+			return result;
+		}
+
+
+		// ============================================================
+		// Little endian readers
+		// ============================================================
+
+		static Bool ReadUInt32LE(
+			const std::vector<unsigned char>& data,
+			UInt64 offset,
+			UInt32& value)
+		{
+			if (offset > data.size())
 				return false;
-			}
 
-			const UInt8 b0 =
-				data[(size_t)offset + 0];
+			if (data.size() - offset < 4)
+				return false;
 
-			const UInt8 b1 =
-				data[(size_t)offset + 1];
-
-			const UInt8 b2 =
-				data[(size_t)offset + 2];
-
-			const UInt8 b3 =
-				data[(size_t)offset + 3];
-
-
-			if (!bigEndian)
-			{
-				value =
-					((UInt32)b0) |
-					((UInt32)b1 << 8) |
-					((UInt32)b2 << 16) |
-					((UInt32)b3 << 24);
-			}
-			else
-			{
-				value =
-					((UInt32)b3) |
-					((UInt32)b2 << 8) |
-					((UInt32)b1 << 16) |
-					((UInt32)b0 << 24);
-			}
+			value =
+				(UInt32)data[(size_t)offset] |
+				((UInt32)data[(size_t)offset + 1] << 8) |
+				((UInt32)data[(size_t)offset + 2] << 16) |
+				((UInt32)data[(size_t)offset + 3] << 24);
 
 			return true;
 		}
 
 
-		// ============================================================
-		// Read Int32
-		// ============================================================
-
-		Bool TexBinAnalyzer::ReadInt32(
-			const std::vector<UInt8>& data,
-			UInt32 offset,
-			Bool bigEndian,
-			Int32& value
-		)
+		static Bool ReadInt32LE(
+			const std::vector<unsigned char>& data,
+			UInt64 offset,
+			Int32& value)
 		{
 			UInt32 raw = 0;
 
-			if (!ReadUInt32(
+			if (!ReadUInt32LE(
 				data,
 				offset,
-				bigEndian,
 				raw))
 			{
 				return false;
@@ -134,84 +214,79 @@ namespace GPTDiva
 		}
 
 
-		// ============================================================
-		// Read Raw Bytes
-		// ============================================================
-
-		Bool TexBinAnalyzer::ReadBytes(
-			const std::vector<UInt8>& data,
-			UInt32 offset,
-			UInt32 size,
-			std::vector<UInt8>& output
-		)
+		static Bool ReadUInt32BE(
+			const std::vector<unsigned char>& data,
+			UInt64 offset,
+			UInt32& value)
 		{
-			output.clear();
-
-			if ((UInt64)offset + (UInt64)size >
-				(UInt64)data.size())
-			{
+			if (offset > data.size())
 				return false;
-			}
 
-			try
-			{
-				output.resize(
-					(size_t)size);
-			}
-			catch (...)
-			{
+			if (data.size() - offset < 4)
 				return false;
-			}
 
-			if (size == 0)
-			{
-				return true;
-			}
-
-			std::copy(
-				data.begin() + (size_t)offset,
-				data.begin() + (size_t)offset + (size_t)size,
-				output.begin());
+			value =
+				((UInt32)data[(size_t)offset] << 24) |
+				((UInt32)data[(size_t)offset + 1] << 16) |
+				((UInt32)data[(size_t)offset + 2] << 8) |
+				(UInt32)data[(size_t)offset + 3];
 
 			return true;
 		}
 
 
 		// ============================================================
-		// Safe Offset Calculation
+		// Safe range
 		// ============================================================
 
-		Bool TexBinAnalyzer::AddOffset(
-			UInt32 base,
-			UInt32 relative,
-			UInt32 dataSize,
-			UInt32& absolute
-		)
+		static Bool IsRangeValid(
+			UInt64 dataSize,
+			UInt64 offset,
+			UInt64 size)
 		{
-			const UInt64 value =
-				(UInt64)base +
-				(UInt64)relative;
-
-			if (value >
-				(UInt64)dataSize)
-			{
+			if (offset > dataSize)
 				return false;
-			}
 
-			absolute =
-				(UInt32)value;
+			if (size > dataSize - offset)
+				return false;
 
 			return true;
 		}
 
 
 		// ============================================================
-		// Texture Format Name
+		// Relative offset
 		// ============================================================
 
-		const char* TexBinAnalyzer::GetTextureFormatName(
-			Int32 format
-		)
+		static Bool ResolveRelativeOffset(
+			UInt64 baseOffset,
+			UInt32 relativeOffset,
+			UInt64 dataSize,
+			UInt32& absoluteOffset)
+		{
+			const UInt64 absolute =
+				baseOffset +
+				(UInt64)relativeOffset;
+
+			if (absolute > dataSize)
+				return false;
+
+			if (absolute > 0xFFFFFFFFULL)
+				return false;
+
+			absoluteOffset =
+				(UInt32)absolute;
+
+			return true;
+		}
+
+
+		// ============================================================
+		// Format name
+		// ============================================================
+
+		const char* GetTextureFormatName(
+			Int32 format)
 		{
 			switch (format)
 			{
@@ -237,7 +312,7 @@ namespace GPTDiva
 				return "DXT1";
 
 			case TEXTURE_FORMAT_DXT1A:
-				return "DXT1A";
+				return "DXT1a";
 
 			case TEXTURE_FORMAT_DXT3:
 				return "DXT3";
@@ -270,315 +345,223 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Parse SubTexture
-		//
-		// MikuMikuLibrary SubTexture.cs:
-		//
-		// UInt32 signature
-		// Int32  width
-		// Int32  height
-		// Int32  format
-		// UInt32 ID
-		// Int32  dataSize
-		// byte[] data
-		//
-		// MML本体ではIDを読み捨てる。
-		// GPT DIVA FARC TOOLでは情報保持のため保存する。
+		// Block compressed
 		// ============================================================
 
-		Bool TexBinAnalyzer::ParseSubTexture(
-			const std::vector<UInt8>& data,
-			UInt32 subTextureOffset,
-			Bool bigEndian,
-			SubTextureInfo& subTexture,
-			UInt32 textureIndex,
-			UInt32 subTextureIndex
-		)
+		Bool IsBlockCompressed(
+			Int32 format)
 		{
-			subTexture =
-				SubTextureInfo();
-
-			subTexture.baseOffset =
-				subTextureOffset;
-
-
-			GePrint(
-				"------------------------------------------------------------");
-
-			GePrint(
-				"SUBTEXTURE ANALYSIS");
-
-			GePrint(
-				"Texture Index : " +
-				String::IntToString(
-				(Int32)textureIndex));
-
-			GePrint(
-				"SubTexture Index : " +
-				String::IntToString(
-				(Int32)subTextureIndex));
-
-			GePrint(
-				"Base Offset : " +
-				String::IntToString(
-				(Int32)subTextureOffset));
+			return
+				(format >= TEXTURE_FORMAT_DXT1 &&
+					format <= TEXTURE_FORMAT_ATI2) ||
+				format == TEXTURE_FORMAT_BC7 ||
+				format == TEXTURE_FORMAT_BC6H;
+		}
 
 
-			// --------------------------------------------------------
-			// Signature
-			// --------------------------------------------------------
+		// ============================================================
+		// Alpha
+		// ============================================================
 
-			UInt32 signature = 0;
-
-			if (!ReadUInt32(
-				data,
-				subTextureOffset + 0,
-				bigEndian,
-				signature))
+		Bool HasAlpha(
+			Int32 format)
+		{
+			switch (format)
 			{
-				GePrint(
-					"SUBTEXTURE : SIGNATURE READ FAILED");
+			case TEXTURE_FORMAT_A8:
+			case TEXTURE_FORMAT_RGBA8:
+			case TEXTURE_FORMAT_RGB5A1:
+			case TEXTURE_FORMAT_RGBA4:
+			case TEXTURE_FORMAT_DXT1A:
+			case TEXTURE_FORMAT_DXT3:
+			case TEXTURE_FORMAT_DXT5:
+			case TEXTURE_FORMAT_BC7:
+				return true;
 
+			default:
 				return false;
 			}
+		}
 
 
-			if (signature !=
-				SUBTEXTURE_SIGNATURE)
+		// ============================================================
+		// Block size
+		// ============================================================
+
+		UInt32 GetBlockSize(
+			Int32 format)
+		{
+			switch (format)
 			{
-				GePrint(
-					"SUBTEXTURE : INVALID SIGNATURE");
+			case TEXTURE_FORMAT_DXT1:
+			case TEXTURE_FORMAT_DXT1A:
+			case TEXTURE_FORMAT_ATI1:
+				return 8;
 
-				GePrint(
-					"Expected : 0x02505854");
+			case TEXTURE_FORMAT_DXT3:
+			case TEXTURE_FORMAT_DXT5:
+			case TEXTURE_FORMAT_ATI2:
+			case TEXTURE_FORMAT_BC7:
+			case TEXTURE_FORMAT_BC6H:
+				return 16;
 
-				GePrint(
-					"Actual : " +
-					String::IntToString(
-					(Int32)signature));
-
-				return false;
+			default:
+				return 0;
 			}
+		}
 
 
-			// --------------------------------------------------------
-			// Width
-			// --------------------------------------------------------
+		// ============================================================
+		// Expected data size
+		// ============================================================
 
-			Int32 width = 0;
-
-			if (!ReadInt32(
-				data,
-				subTextureOffset + 4,
-				bigEndian,
-				width))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Height
-			// --------------------------------------------------------
-
-			Int32 height = 0;
-
-			if (!ReadInt32(
-				data,
-				subTextureOffset + 8,
-				bigEndian,
-				height))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Format
-			// --------------------------------------------------------
-
-			Int32 format = 0;
-
-			if (!ReadInt32(
-				data,
-				subTextureOffset + 12,
-				bigEndian,
-				format))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// ID
-			// --------------------------------------------------------
-
-			UInt32 id = 0;
-
-			if (!ReadUInt32(
-				data,
-				subTextureOffset + 16,
-				bigEndian,
-				id))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Data Size
-			// --------------------------------------------------------
-
-			Int32 signedDataSize = 0;
-
-			if (!ReadInt32(
-				data,
-				subTextureOffset + 20,
-				bigEndian,
-				signedDataSize))
-			{
-				return false;
-			}
-
-
+		UInt64 CalculateExpectedDataSize(
+			Int32 width,
+			Int32 height,
+			Int32 format)
+		{
 			if (width <= 0 ||
 				height <= 0)
 			{
-				GePrint(
-					"SUBTEXTURE : INVALID DIMENSIONS");
-
-				return false;
+				return 0;
 			}
 
 
-			if (signedDataSize < 0)
+			switch (format)
 			{
-				GePrint(
-					"SUBTEXTURE : NEGATIVE DATA SIZE");
+			case TEXTURE_FORMAT_A8:
+			case TEXTURE_FORMAT_L8:
+				return
+					(UInt64)width *
+					(UInt64)height;
 
+
+			case TEXTURE_FORMAT_RGB8:
+				return
+					(UInt64)width *
+					(UInt64)height *
+					3ULL;
+
+
+			case TEXTURE_FORMAT_RGBA8:
+				return
+					(UInt64)width *
+					(UInt64)height *
+					4ULL;
+
+
+			case TEXTURE_FORMAT_RGB5:
+			case TEXTURE_FORMAT_RGB5A1:
+			case TEXTURE_FORMAT_RGBA4:
+			case TEXTURE_FORMAT_L8A8:
+				return
+					(UInt64)width *
+					(UInt64)height *
+					2ULL;
+
+
+			default:
+			{
+				const UInt32 blockSize =
+					GetBlockSize(format);
+
+				if (blockSize == 0)
+					return 0;
+
+				const UInt64 blocksX =
+					(UInt64)((width + 3) / 4);
+
+				const UInt64 blocksY =
+					(UInt64)((height + 3) / 4);
+
+				return
+					blocksX *
+					blocksY *
+					(UInt64)blockSize;
+			}
+			}
+		}
+
+
+		// ============================================================
+		// Payload validation
+		//
+		// ここではデコードしない。
+		//
+		// 確認項目:
+		//   1. dataOffset がファイル内
+		//   2. dataSize がファイル内
+		//   3. data vector のサイズ一致
+		//   4. Expected Size が既知なら一致確認
+		//
+		// Expected Size 不一致の場合も、直ちに解析失敗にはしない。
+		// これはMikuMikuLibrary側の特殊形式を推測で否定しないため。
+		// ============================================================
+
+		static Bool ValidateSubTexturePayload(
+			const std::vector<unsigned char>& sourceData,
+			const SubTextureInfo& sub,
+			UInt64 expectedSize,
+			Bool& expectedSizeMatch)
+		{
+			expectedSizeMatch =
+				false;
+
+
+			if (sub.dataOffset > sourceData.size())
+				return false;
+
+
+			if (!IsRangeValid(
+				sourceData.size(),
+				(UInt64)sub.dataOffset,
+				(UInt64)sub.dataSize))
+			{
 				return false;
 			}
 
 
-			const UInt32 dataSize =
-				(UInt32)signedDataSize;
+			if ((UInt64)sub.data.size() !=
+				(UInt64)sub.dataSize)
+			{
+				return false;
+			}
 
 
-			// --------------------------------------------------------
-			// Data begins immediately after the 24-byte header.
-			// --------------------------------------------------------
+			if (expectedSize != 0)
+			{
+				expectedSizeMatch =
+					expectedSize ==
+					(UInt64)sub.dataSize;
+			}
 
-			UInt32 dataOffset = 0;
 
-			if (!AddOffset(
+			return true;
+		}
+
+
+		// ============================================================
+		// Parse SubTexture
+		// ============================================================
+
+		static Bool ParseSubTexture(
+			const std::vector<unsigned char>& data,
+			UInt32 subTextureOffset,
+			SubTextureInfo& result)
+		{
+			result =
+				SubTextureInfo();
+
+			result.offset =
+				subTextureOffset;
+
+
+			UInt32 signature = 0;
+
+
+			if (!ReadUInt32LE(
+				data,
 				subTextureOffset,
-				24,
-				(UInt32)data.size(),
-				dataOffset))
-			{
-				return false;
-			}
-
-
-			std::vector<UInt8> rawData;
-
-			if (!ReadBytes(
-				data,
-				dataOffset,
-				dataSize,
-				rawData))
-			{
-				GePrint(
-					"SUBTEXTURE : DATA OUT OF RANGE");
-
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Store result.
-			// --------------------------------------------------------
-
-			subTexture.valid =
-				true;
-
-			subTexture.signature =
-				signature;
-
-			subTexture.width =
-				width;
-
-			subTexture.height =
-				height;
-
-			subTexture.format =
-				format;
-
-			subTexture.id =
-				id;
-
-			subTexture.dataSize =
-				dataSize;
-
-			subTexture.data.swap(
-				rawData);
-
-
-			PrintSubTexture(
-				subTexture,
-				textureIndex,
-				subTextureIndex);
-
-
-			return true;
-		}
-
-
-		// ============================================================
-		// Parse Texture
-		//
-		// MikuMikuLibrary Texture.cs:
-		//
-		// signature
-		// subTextureCount
-		// info
-		//
-		// mipMapCount = info & 0xFF
-		// arraySize   = (info >> 8) & 0xFF
-		//
-		// if arraySize == 1 &&
-		//    mipMapCount != subTextureCount
-		// {
-		//     mipMapCount = (byte)subTextureCount;
-		// }
-		// ============================================================
-
-		Bool TexBinAnalyzer::ParseTexture(
-			const std::vector<UInt8>& data,
-			UInt32 textureOffset,
-			Bool bigEndian,
-			TextureInfo& texture,
-			UInt32 textureIndex,
-			TextureSetAnalysisResult& result
-		)
-		{
-			texture =
-				TextureInfo();
-
-			texture.baseOffset =
-				textureOffset;
-
-
-			// --------------------------------------------------------
-			// Signature
-			// --------------------------------------------------------
-
-			UInt32 signature = 0;
-
-			if (!ReadUInt32(
-				data,
-				textureOffset + 0,
-				bigEndian,
 				signature))
 			{
 				return false;
@@ -586,357 +569,7 @@ namespace GPTDiva
 
 
 			if (signature !=
-				TEXTURE_SIGNATURE_TYPE4 &&
-				signature !=
-				TEXTURE_SIGNATURE_TYPE5)
-			{
-				GePrint(
-					"TEXTURE : INVALID SIGNATURE");
-
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// SubTexture Count
-			// --------------------------------------------------------
-
-			UInt32 subTextureCount = 0;
-
-			if (!ReadUInt32(
-				data,
-				textureOffset + 4,
-				bigEndian,
-				subTextureCount))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Info
-			// --------------------------------------------------------
-
-			UInt32 info = 0;
-
-			if (!ReadUInt32(
-				data,
-				textureOffset + 8,
-				bigEndian,
-				info))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Decode info.
-			//
-			// Exact MikuMikuLibrary behavior.
-			// --------------------------------------------------------
-
-			UInt32 mipMapCount =
-				info & 0xFFu;
-
-			UInt32 arraySize =
-				(info >> 8) & 0xFFu;
-
-
-			if (arraySize == 1 &&
-				mipMapCount != subTextureCount)
-			{
-				mipMapCount =
-					(UInt8)subTextureCount;
-			}
-
-
-			// --------------------------------------------------------
-			// The managed implementation creates:
-			//
-			// new SubTexture[arraySize, mipMapCount]
-			//
-			// Therefore zero dimensions are not valid for the
-			// Texture object we are reconstructing.
-			// --------------------------------------------------------
-
-			if (arraySize == 0)
-			{
-				GePrint(
-					"TEXTURE : ARRAY SIZE = 0");
-
-				return false;
-			}
-
-
-			if (mipMapCount == 0)
-			{
-				GePrint(
-					"TEXTURE : MIPMAP COUNT = 0");
-
-				return false;
-			}
-
-
-			const UInt64 expectedSubTextureCount =
-				(UInt64)arraySize *
-				(UInt64)mipMapCount;
-
-
-			if (expectedSubTextureCount >
-				(UInt64)std::numeric_limits<UInt32>::max())
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Store header information.
-			// --------------------------------------------------------
-
-			texture.signature =
-				signature;
-
-			texture.subTextureCount =
-				subTextureCount;
-
-			texture.info =
-				info;
-
-			texture.mipMapCount =
-				mipMapCount;
-
-			texture.arraySize =
-				arraySize;
-
-			texture.usesArraySize =
-				(arraySize > 1);
-
-			texture.usesMipMaps =
-				(mipMapCount > 1);
-
-
-			texture.subTextures.clear();
-
-			try
-			{
-				texture.subTextures.reserve(
-					(size_t)expectedSubTextureCount);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-
-			GePrint(
-				"============================================================");
-
-			GePrint(
-				"TEX.BIN TEXTURE");
-
-			GePrint(
-				"Texture Index : " +
-				String::IntToString(
-				(Int32)textureIndex));
-
-			GePrint(
-				"Texture Offset : " +
-				String::IntToString(
-				(Int32)textureOffset));
-
-			GePrint(
-				"Signature : " +
-				String::IntToString(
-				(Int32)signature));
-
-			GePrint(
-				"SubTexture Count : " +
-				String::IntToString(
-				(Int32)subTextureCount));
-
-			GePrint(
-				"Info : " +
-				String::IntToString(
-				(Int32)info));
-
-			GePrint(
-				"MipMap Count : " +
-				String::IntToString(
-				(Int32)mipMapCount));
-
-			GePrint(
-				"Array Size : " +
-				String::IntToString(
-				(Int32)arraySize));
-
-
-			// --------------------------------------------------------
-			// Texture::Read()
-			//
-			// The Texture object pushes its own base offset.
-			// Consequently each SubTexture offset is relative to
-			// textureOffset.
-			// --------------------------------------------------------
-
-			UInt32 offsetTablePosition =
-				textureOffset + 12;
-
-
-			for (UInt32 arrayIndex = 0;
-				arrayIndex < arraySize;
-				++arrayIndex)
-			{
-				for (UInt32 mipMapIndex = 0;
-					mipMapIndex < mipMapCount;
-					++mipMapIndex)
-				{
-					UInt32 relativeOffset = 0;
-
-					if (!ReadUInt32(
-						data,
-						offsetTablePosition,
-						bigEndian,
-						relativeOffset))
-					{
-						GePrint(
-							"TEXTURE : OFFSET TABLE READ FAILED");
-
-						return false;
-					}
-
-
-					offsetTablePosition +=
-						4;
-
-
-					UInt32 absoluteOffset = 0;
-
-					if (!AddOffset(
-						textureOffset,
-						relativeOffset,
-						(UInt32)data.size(),
-						absoluteOffset))
-					{
-						GePrint(
-							"TEXTURE : SUBTEXTURE OFFSET OUT OF RANGE");
-
-						return false;
-					}
-
-
-					const UInt32 subTextureIndex =
-						(UInt32)texture.subTextures.size();
-
-
-					SubTextureInfo subTexture;
-
-
-					if (!ParseSubTexture(
-						data,
-						absoluteOffset,
-						bigEndian,
-						subTexture,
-						textureIndex,
-						subTextureIndex))
-					{
-						return false;
-					}
-
-
-					texture.subTextures.push_back(
-						subTexture);
-
-
-					result.parsedSubTextureCount++;
-
-					result.totalTextureDataBytes +=
-						(UInt64)subTexture.dataSize;
-				}
-			}
-
-
-			texture.valid =
-				true;
-
-
-			PrintTexture(
-				texture,
-				textureIndex);
-
-
-			return true;
-		}
-
-
-		// ============================================================
-		// Parse TextureSet
-		//
-		// MikuMikuLibrary TextureSet.cs:
-		//
-		// PushBaseOffset()
-		// signature
-		// textureCount
-		// textureCountWithRubbish
-		// texture offsets
-		// PopBaseOffset()
-		// ============================================================
-
-		Bool TexBinAnalyzer::ParseTextureSet(
-			const std::vector<UInt8>& data,
-			Bool bigEndian,
-			TextureSetAnalysisResult& result
-		)
-		{
-			// --------------------------------------------------------
-			// Signature
-			// --------------------------------------------------------
-
-			UInt32 signature = 0;
-
-			if (!ReadUInt32(
-				data,
-				0,
-				bigEndian,
-				signature))
-			{
-				return false;
-			}
-
-
-			if (signature !=
-				TEXSET_SIGNATURE)
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Texture Count
-			// --------------------------------------------------------
-
-			UInt32 textureCount = 0;
-
-			if (!ReadUInt32(
-				data,
-				4,
-				bigEndian,
-				textureCount))
-			{
-				return false;
-			}
-
-
-			// --------------------------------------------------------
-			// Texture Count With Rubbish
-			// --------------------------------------------------------
-
-			UInt32 textureCountWithRubbish = 0;
-
-			if (!ReadUInt32(
-				data,
-				8,
-				bigEndian,
-				textureCountWithRubbish))
+				TXP_SIGNATURE_TYPE_2)
 			{
 				return false;
 			}
@@ -945,158 +578,129 @@ namespace GPTDiva
 			result.signature =
 				signature;
 
-			result.textureCount =
-				textureCount;
 
-			result.textureCountWithRubbish =
-				textureCountWithRubbish;
+			Int32 width = 0;
+			Int32 height = 0;
+			Int32 format = 0;
 
-			result.bigEndian =
-				bigEndian;
-
-			result.logicalSize =
-				(UInt32)data.size();
+			UInt32 id = 0;
+			UInt32 dataSize = 0;
 
 
-			GePrint(
-				"============================================================");
-
-			GePrint(
-				"GPT DIVA FARC TOOL : TEX.BIN ANALYSIS");
-
-			GePrint(
-				"============================================================");
-
-			GePrint(
-				"Signature : 0x03505854");
-
-			GePrint(
-				"Format : TXP Type 3");
-
-			GePrint(
-				"Endianness : " +
-				String(
-					bigEndian ?
-					"BIG" :
-					"LITTLE"));
-
-			GePrint(
-				"Logical Size : " +
-				String::IntToString(
-				(Int32)data.size()));
-
-			GePrint(
-				"Texture Count : " +
-				String::IntToString(
-				(Int32)textureCount));
-
-			GePrint(
-				"Texture Count With Rubbish : " +
-				String::IntToString(
-				(Int32)textureCountWithRubbish));
-
-
-			// --------------------------------------------------------
-			// Texture offsets start immediately after the 12-byte
-			// TextureSet header.
-			//
-			// TextureSet.Write():
-			//
-			//   Write(signature)
-			//   Write(Texture.Count)
-			//   Write(Texture.Count | 0x01010100)
-			//   WriteOffset(...)
-			// --------------------------------------------------------
-
-			UInt32 offsetTablePosition =
-				12;
-
-
-			result.textures.clear();
-
-			try
-			{
-				result.textures.reserve(
-					(size_t)textureCount);
-			}
-			catch (...)
+			if (!ReadInt32LE(
+				data,
+				(UInt64)subTextureOffset + 4,
+				width))
 			{
 				return false;
 			}
 
 
-			for (UInt32 textureIndex = 0;
-				textureIndex < textureCount;
-				++textureIndex)
+			if (!ReadInt32LE(
+				data,
+				(UInt64)subTextureOffset + 8,
+				height))
 			{
-				UInt32 relativeOffset = 0;
-
-				if (!ReadUInt32(
-					data,
-					offsetTablePosition,
-					bigEndian,
-					relativeOffset))
-				{
-					GePrint(
-						"TEXSET : TEXTURE OFFSET READ FAILED");
-
-					return false;
-				}
-
-
-				offsetTablePosition +=
-					4;
-
-
-				// TextureSet has pushed the root base offset.
-				// Root base is zero in this in-memory representation.
-				UInt32 textureOffset = 0;
-
-				if (!AddOffset(
-					0,
-					relativeOffset,
-					(UInt32)data.size(),
-					textureOffset))
-				{
-					GePrint(
-						"TEXSET : TEXTURE OFFSET OUT OF RANGE");
-
-					return false;
-				}
-
-
-				GePrint(
-					"TEXTURE[" +
-					String::IntToString(
-					(Int32)textureIndex) +
-					"] OFFSET : " +
-					String::IntToString(
-					(Int32)textureOffset));
-
-
-				TextureInfo texture;
-
-
-				if (!ParseTexture(
-					data,
-					textureOffset,
-					bigEndian,
-					texture,
-					textureIndex,
-					result))
-				{
-					GePrint(
-						"TEXSET : TEXTURE PARSE FAILED");
-
-					return false;
-				}
-
-
-				result.textures.push_back(
-					texture);
-
-				result.parsedTextureCount++;
+				return false;
 			}
+
+
+			if (!ReadInt32LE(
+				data,
+				(UInt64)subTextureOffset + 12,
+				format))
+			{
+				return false;
+			}
+
+
+			if (!ReadUInt32LE(
+				data,
+				(UInt64)subTextureOffset + 16,
+				id))
+			{
+				return false;
+			}
+
+
+			if (!ReadUInt32LE(
+				data,
+				(UInt64)subTextureOffset + 20,
+				dataSize))
+			{
+				return false;
+			}
+
+
+			if (width <= 0 ||
+				height <= 0)
+			{
+				return false;
+			}
+
+
+			if ((UInt64)dataSize >
+				MAX_SINGLE_PAYLOAD_SIZE)
+			{
+				return false;
+			}
+
+
+			const UInt64 payloadOffset =
+				(UInt64)subTextureOffset +
+				24ULL;
+
+
+			if (!IsRangeValid(
+				data.size(),
+				payloadOffset,
+				(UInt64)dataSize))
+			{
+				return false;
+			}
+
+
+			if (payloadOffset >
+				0xFFFFFFFFULL)
+			{
+				return false;
+			}
+
+
+			result.width =
+				width;
+
+			result.height =
+				height;
+
+			result.format =
+				format;
+
+			result.id =
+				id;
+
+			result.dataSize =
+				dataSize;
+
+			result.dataOffset =
+				(UInt32)payloadOffset;
+
+
+			result.data.resize(
+				(size_t)dataSize);
+
+
+			if (dataSize > 0)
+			{
+				std::memcpy(
+					&result.data[0],
+					&data[(size_t)payloadOffset],
+					(size_t)dataSize);
+			}
+
+
+			result.valid =
+				true;
 
 
 			return true;
@@ -1104,207 +708,201 @@ namespace GPTDiva
 
 
 		// ============================================================
-		// Print Header
+		// Parse Texture
 		// ============================================================
 
-		void TexBinAnalyzer::PrintHeader(
-			const TextureSetAnalysisResult& result
-		)
+		static Bool ParseTexture(
+			const std::vector<unsigned char>& data,
+			UInt32 textureOffset,
+			TextureInfo& result)
 		{
-			GePrint(
-				"============================================================");
+			result =
+				TextureInfo();
 
-			GePrint(
-				"TEX.BIN ANALYSIS SUMMARY");
-
-			GePrint(
-				"============================================================");
-
-			GePrint(
-				"Signature : 0x03505854");
-
-			GePrint(
-				"Texture Count : " +
-				String::IntToString(
-				(Int32)result.textureCount));
-
-			GePrint(
-				"Parsed Texture Count : " +
-				String::IntToString(
-				(Int32)result.parsedTextureCount));
-
-			GePrint(
-				"Parsed SubTexture Count : " +
-				String::IntToString(
-				(Int32)result.parsedSubTextureCount));
-
-			GePrint(
-				"Total Texture Data Bytes : " +
-				String::IntToString(
-				(Int32)result.totalTextureDataBytes));
-
-			GePrint(
-				"============================================================");
-		}
+			result.offset =
+				textureOffset;
 
 
-		// ============================================================
-		// Print Texture
-		// ============================================================
-
-		void TexBinAnalyzer::PrintTexture(
-			const TextureInfo& texture,
-			UInt32 textureIndex
-		)
-		{
-			GePrint(
-				"------------------------------------------------------------");
-
-			GePrint(
-				"TEXTURE SUMMARY");
-
-			GePrint(
-				"Texture[" +
-				String::IntToString(
-				(Int32)textureIndex) +
-				"]");
-
-			GePrint(
-				"Signature : " +
-				String::IntToString(
-				(Int32)texture.signature));
-
-			GePrint(
-				"SubTexture Count Header : " +
-				String::IntToString(
-				(Int32)texture.subTextureCount));
-
-			GePrint(
-				"MipMap Count : " +
-				String::IntToString(
-				(Int32)texture.mipMapCount));
-
-			GePrint(
-				"Array Size : " +
-				String::IntToString(
-				(Int32)texture.arraySize));
-
-			GePrint(
-				"Parsed SubTextures : " +
-				String::IntToString(
-				(Int32)texture.subTextures.size()));
+			UInt32 signature = 0;
 
 
-			if (!texture.subTextures.empty())
+			if (!ReadUInt32LE(
+				data,
+				textureOffset,
+				signature))
 			{
-				const SubTextureInfo& first =
-					texture.subTextures[0];
-
-
-				GePrint(
-					"Width : " +
-					String::IntToString(
-						first.width));
-
-
-				GePrint(
-					"Height : " +
-					String::IntToString(
-						first.height));
-
-
-				GePrint(
-					"Format : " +
-					String::IntToString(
-						first.format) +
-					" (" +
-					String(
-						GetTextureFormatName(
-							first.format)) +
-					")");
-
-
-				GePrint(
-					"Data Size : " +
-					String::IntToString(
-					(Int32)first.dataSize));
+				return false;
 			}
-		}
 
 
-		// ============================================================
-		// Print SubTexture
-		// ============================================================
-
-		void TexBinAnalyzer::PrintSubTexture(
-			const SubTextureInfo& subTexture,
-			UInt32 textureIndex,
-			UInt32 subTextureIndex
-		)
-		{
-			GePrint(
-				"SUBTEXTURE[" +
-				String::IntToString(
-				(Int32)subTextureIndex) +
-				"]");
+			if (signature !=
+				TXP_SIGNATURE_TYPE_4 &&
+				signature !=
+				TXP_SIGNATURE_TYPE_5)
+			{
+				return false;
+			}
 
 
-			GePrint(
-				"  Texture : " +
-				String::IntToString(
-				(Int32)textureIndex));
+			result.signature =
+				signature;
 
 
-			GePrint(
-				"  Offset : " +
-				String::IntToString(
-				(Int32)subTexture.baseOffset));
+			UInt32 subTextureCount = 0;
+			UInt32 info = 0;
 
 
-			GePrint(
-				"  Width : " +
-				String::IntToString(
-					subTexture.width));
+			if (!ReadUInt32LE(
+				data,
+				(UInt64)textureOffset + 4,
+				subTextureCount))
+			{
+				return false;
+			}
 
 
-			GePrint(
-				"  Height : " +
-				String::IntToString(
-					subTexture.height));
+			if (!ReadUInt32LE(
+				data,
+				(UInt64)textureOffset + 8,
+				info))
+			{
+				return false;
+			}
 
 
-			GePrint(
-				"  Format : " +
-				String::IntToString(
-					subTexture.format) +
-				" (" +
-				String(
-					GetTextureFormatName(
-						subTexture.format)) +
-				")");
+			const UInt32 mipMapCount =
+				info & 0xFFU;
 
 
-			GePrint(
-				"  ID : " +
-				String::IntToString(
-				(Int32)subTexture.id));
+			const UInt32 arraySize =
+				(info >> 8) & 0xFFU;
 
 
-			GePrint(
-				"  Data Size : " +
-				String::IntToString(
-				(Int32)subTexture.dataSize));
+			if (subTextureCount == 0)
+				return false;
 
 
-			GePrint(
-				"  Data : " +
-				String::IntToString(
-				(Int32)subTexture.data.size()) +
-				" bytes");
+			if (subTextureCount >
+				MAX_SUBTEXTURE_COUNT)
+			{
+				return false;
+			}
 
 
-			GePrint(
-				"  RESULT : VALID");
+			UInt32 actualMipMapCount =
+				mipMapCount;
+
+
+			UInt32 actualArraySize =
+				arraySize;
+
+
+			if (actualArraySize == 0)
+				actualArraySize = 1;
+
+
+			if (actualArraySize == 1 &&
+				actualMipMapCount !=
+				subTextureCount)
+			{
+				actualMipMapCount =
+					(UInt32)((unsigned char)
+						subTextureCount);
+			}
+
+
+			if (actualMipMapCount == 0)
+				return false;
+
+
+			result.subTextureCount =
+				subTextureCount;
+
+			result.info =
+				info;
+
+			result.mipMapCount =
+				actualMipMapCount;
+
+			result.arraySize =
+				actualArraySize;
+
+
+			const UInt64 offsetTable =
+				(UInt64)textureOffset +
+				12ULL;
+
+
+			const UInt64 offsetTableSize =
+				(UInt64)subTextureCount *
+				4ULL;
+
+
+			if (!IsRangeValid(
+				data.size(),
+				offsetTable,
+				offsetTableSize))
+			{
+				return false;
+			}
+
+
+			result.subTextures.reserve(
+				(size_t)subTextureCount);
+
+
+			for (UInt32 i = 0;
+				i < subTextureCount;
+				++i)
+			{
+				UInt32 relativeOffset = 0;
+
+
+				if (!ReadUInt32LE(
+					data,
+					offsetTable +
+					(UInt64)i * 4ULL,
+					relativeOffset))
+				{
+					return false;
+				}
+
+
+				UInt32 absoluteOffset = 0;
+
+
+				if (!ResolveRelativeOffset(
+					textureOffset,
+					relativeOffset,
+					data.size(),
+					absoluteOffset))
+				{
+					return false;
+				}
+
+
+				SubTextureInfo subTexture;
+
+
+				if (!ParseSubTexture(
+					data,
+					absoluteOffset,
+					subTexture))
+				{
+					return false;
+				}
+
+
+				result.subTextures.push_back(
+					subTexture);
+			}
+
+
+			result.valid =
+				true;
+
+
+			return true;
 		}
 
 
@@ -1312,166 +910,735 @@ namespace GPTDiva
 		// Main Analyze
 		// ============================================================
 
-		Bool TexBinAnalyzer::Analyze(
-			const std::vector<UInt8>& data,
-			TextureSetAnalysisResult& result
-		)
+		Bool Analyze(
+			const std::vector<unsigned char>& data,
+			AnalysisResult& result)
 		{
 			result =
-				TextureSetAnalysisResult();
+				AnalysisResult();
 
 
-			if (data.size() < 12)
+			if (data.empty())
 			{
 				GePrint(
-					"TEX.BIN ANALYSIS : DATA TOO SMALL");
+					String(
+						"TEX.BIN ANALYZER : EMPTY DATA"));
 
 				return false;
 			}
 
 
-			// --------------------------------------------------------
-			// MikuMikuLibrary TextureSet.cs:
-			//
-			// reader.ReadInt32()
-			//
-			// If signature is not TXP Type 3:
-			//
-			//   reader.Endianness = Endianness.Big
-			//   signature = ReverseEndianness(signature)
-			//
-			// Native Little Endian representation:
-			//
-			//   54 58 50 03
-			//
-			// => 0x03505854
-			// --------------------------------------------------------
+			UInt32 signature = 0;
 
-			UInt32 littleSignature = 0;
 
-			if (!ReadUInt32(
+			if (!ReadUInt32LE(
 				data,
 				0,
-				false,
-				littleSignature))
+				signature))
 			{
 				return false;
 			}
 
 
-			Bool bigEndian =
-				false;
-
-
-			if (littleSignature !=
-				TEXSET_SIGNATURE)
+			if (signature !=
+				TXP_SIGNATURE_TYPE_3)
 			{
-				UInt32 bigSignature = 0;
+				UInt32 reversedSignature = 0;
 
-				if (!ReadUInt32(
+
+				if (!ReadUInt32BE(
 					data,
 					0,
-					true,
-					bigSignature))
+					reversedSignature))
 				{
 					return false;
 				}
 
 
-				if (bigSignature !=
-					TEXSET_SIGNATURE)
+				if (reversedSignature ==
+					TXP_SIGNATURE_TYPE_3)
 				{
 					GePrint(
-						"TEX.BIN ANALYSIS : INVALID TXP TYPE 3 SIGNATURE");
-
-					GePrint(
-						"Expected : 0x03505854");
-
-					GePrint(
-						"Actual Little : " +
-						String::IntToString(
-						(Int32)littleSignature));
-
-					GePrint(
-						"Actual Big : " +
-						String::IntToString(
-						(Int32)bigSignature));
-
-					return false;
+						String(
+							"TEX.BIN ANALYZER : BIG-ENDIAN TXP DETECTED"));
 				}
 
 
-				bigEndian =
-					true;
+				GePrint(
+					String(
+						"TEX.BIN ANALYZER : INVALID TXP TYPE 3"));
+
+				return false;
 			}
 
 
+			result.signature =
+				signature;
+
+
 			// --------------------------------------------------------
-			// Parse TextureSet.
+			// TextureSet header
 			// --------------------------------------------------------
 
-			if (!ParseTextureSet(
+			UInt32 textureCount = 0;
+			UInt32 textureCountWithRubbish = 0;
+
+
+			if (!ReadUInt32LE(
 				data,
-				bigEndian,
-				result))
+				4,
+				textureCount))
+			{
+				return false;
+			}
+
+
+			if (!ReadUInt32LE(
+				data,
+				8,
+				textureCountWithRubbish))
+			{
+				return false;
+			}
+
+
+			if (textureCount >
+				MAX_TEXTURE_COUNT)
 			{
 				GePrint(
-					"TEX.BIN ANALYSIS : FAILED");
+					String(
+						"TEX.BIN ANALYZER : TEXTURE COUNT TOO LARGE"));
 
 				return false;
 			}
 
 
-			// --------------------------------------------------------
-			// All Texture objects must have been parsed.
-			// --------------------------------------------------------
+			const UInt64 offsetTableSize =
+				(UInt64)textureCount *
+				4ULL;
 
-			if (result.parsedTextureCount !=
-				result.textureCount)
+
+			if (!IsRangeValid(
+				data.size(),
+				12,
+				offsetTableSize))
 			{
 				GePrint(
-					"TEX.BIN ANALYSIS : TEXTURE COUNT MISMATCH");
-
-				GePrint(
-					"Header Count : " +
-					String::IntToString(
-					(Int32)result.textureCount));
-
-				GePrint(
-					"Parsed Count : " +
-					String::IntToString(
-					(Int32)result.parsedTextureCount));
+					String(
+						"TEX.BIN ANALYZER : TEXTURE OFFSET TABLE OUT OF RANGE"));
 
 				return false;
 			}
 
+
+			result.textureCount =
+				textureCount;
+
+			result.textureCountWithRubbish =
+				textureCountWithRubbish;
+
+
+			result.textureOffsets.reserve(
+				(size_t)textureCount);
+
+
+			result.textures.reserve(
+				(size_t)textureCount);
+
+
+			// --------------------------------------------------------
+			// Texture table
+			// --------------------------------------------------------
+
+			for (UInt32 i = 0;
+				i < textureCount;
+				++i)
+			{
+				UInt32 relativeOffset = 0;
+
+
+				if (!ReadUInt32LE(
+					data,
+					12ULL +
+					(UInt64)i * 4ULL,
+					relativeOffset))
+				{
+					result.invalidTextureCount++;
+					continue;
+				}
+
+
+				UInt32 absoluteOffset = 0;
+
+
+				if (!ResolveRelativeOffset(
+					0,
+					relativeOffset,
+					data.size(),
+					absoluteOffset))
+				{
+					result.invalidTextureCount++;
+					continue;
+				}
+
+
+				result.textureOffsets.push_back(
+					absoluteOffset);
+
+
+				TextureInfo texture;
+
+
+				if (!ParseTexture(
+					data,
+					absoluteOffset,
+					texture))
+				{
+					result.invalidTextureCount++;
+
+					result.textures.push_back(
+						texture);
+
+					continue;
+				}
+
+
+				result.validTextureCount++;
+
+
+				result.validSubTextureCount +=
+					(UInt32)texture.subTextures.size();
+
+
+				for (size_t s = 0;
+					s < texture.subTextures.size();
+					++s)
+				{
+					const SubTextureInfo& sub =
+						texture.subTextures[s];
+
+
+					result.totalPayloadBytes +=
+						(UInt64)sub.dataSize;
+				}
+
+
+				result.textures.push_back(
+					texture);
+			}
+
+
+			// --------------------------------------------------------
+			// Basic count consistency
+			// --------------------------------------------------------
+
+			if (result.textureOffsets.size() !=
+				(size_t)textureCount)
+			{
+				GePrint(
+					String(
+						"TEX.BIN ANALYZER : OFFSET TABLE PARSE MISMATCH"));
+
+				return false;
+			}
+
+
+			if (result.textures.size() !=
+				(size_t)textureCount)
+			{
+				GePrint(
+					String(
+						"TEX.BIN ANALYZER : TEXTURE ARRAY PARSE MISMATCH"));
+
+				return false;
+			}
+
+
+			// ========================================================
+			// Payload Validation
+			// ========================================================
+
+			UInt32 payloadValidCount = 0;
+			UInt32 payloadInvalidCount = 0;
+			UInt32 expectedMatchCount = 0;
+			UInt32 expectedMismatchCount = 0;
+
+
+			for (UInt32 i = 0;
+				i < textureCount;
+				++i)
+			{
+				TextureInfo& texture =
+					result.textures[i];
+
+
+				if (!texture.valid)
+					continue;
+
+
+				for (size_t s = 0;
+					s < texture.subTextures.size();
+					++s)
+				{
+					SubTextureInfo& sub =
+						texture.subTextures[s];
+
+
+					if (!sub.valid)
+					{
+						payloadInvalidCount++;
+						continue;
+					}
+
+
+					const UInt64 expectedSize =
+						CalculateExpectedDataSize(
+							sub.width,
+							sub.height,
+							sub.format);
+
+
+					Bool expectedSizeMatch =
+						false;
+
+
+					const Bool payloadValid =
+						ValidateSubTexturePayload(
+							data,
+							sub,
+							expectedSize,
+							expectedSizeMatch);
+
+
+					if (payloadValid)
+					{
+						payloadValidCount++;
+					}
+					else
+					{
+						payloadInvalidCount++;
+					}
+
+
+					if (expectedSize != 0)
+					{
+						if (expectedSizeMatch)
+						{
+							expectedMatchCount++;
+						}
+						else
+						{
+							expectedMismatchCount++;
+						}
+					}
+				}
+			}
+
+
+			// --------------------------------------------------------
+			// Final result
+			//
+			// 既存の解析成功条件は変更しない。
+			//
+			// Payload mismatchを見つけても、ここでは
+			// 独自仕様と断定せず診断情報として扱う。
+			// --------------------------------------------------------
 
 			result.success =
-				true;
+				(result.invalidTextureCount == 0 &&
+					result.invalidSubTextureCount == 0 &&
+					result.validTextureCount ==
+					textureCount);
 
 
-			PrintHeader(
-				result);
+			// ========================================================
+			// Diagnostic output
+			// ========================================================
+
+			GePrint(
+				String(
+					"============================================================"));
+
+			GePrint(
+				String(
+					"GPT DIVA FARC TOOL : TEX.BIN ANALYSIS"));
+
+			GePrint(
+				String(
+					"============================================================"));
+
+			GePrint(
+				String(
+					"BUILD : ") +
+				String(
+					TEXBIN_ANALYZER_BUILD_MARKER));
 
 
 			GePrint(
-				"GPT DIVA FARC TOOL : TEX.BIN ANALYSIS SUCCESS");
+				String(
+					"TXP Signature : ") +
+				UInt32ToHexString(
+					result.signature));
+
 
 			GePrint(
-				"Texture Count : " +
+				String(
+					"Texture Count : ") +
 				String::IntToString(
-				(Int32)result.parsedTextureCount));
+				(Int32)result.textureCount));
+
 
 			GePrint(
-				"SubTexture Count : " +
+				String(
+					"Texture Count With Rubbish : ") +
+				UInt32ToHexString(
+					result.textureCountWithRubbish));
+
+
+			GePrint(
+				String(
+					"Valid Texture Count : ") +
 				String::IntToString(
-				(Int32)result.parsedSubTextureCount));
+				(Int32)result.validTextureCount));
+
 
 			GePrint(
-				"============================================================");
+				String(
+					"Invalid Texture Count : ") +
+				String::IntToString(
+				(Int32)result.invalidTextureCount));
 
 
-			return true;
+			GePrint(
+				String(
+					"Valid SubTexture Count : ") +
+				String::IntToString(
+				(Int32)result.validSubTextureCount));
+
+
+			GePrint(
+				String(
+					"Total Payload Bytes : ") +
+				String::IntToString(
+				(Int32)
+					(result.totalPayloadBytes >
+						0x7FFFFFFFULL
+						? 0x7FFFFFFF
+						: result.totalPayloadBytes)));
+
+
+			GePrint(
+				String(
+					"------------------------------------------------------------"));
+
+			GePrint(
+				String(
+					"PAYLOAD VALID COUNT : ") +
+				String::IntToString(
+				(Int32)payloadValidCount));
+
+
+			GePrint(
+				String(
+					"PAYLOAD INVALID COUNT : ") +
+				String::IntToString(
+				(Int32)payloadInvalidCount));
+
+
+			GePrint(
+				String(
+					"EXPECTED SIZE MATCH COUNT : ") +
+				String::IntToString(
+				(Int32)expectedMatchCount));
+
+
+			GePrint(
+				String(
+					"EXPECTED SIZE MISMATCH COUNT : ") +
+				String::IntToString(
+				(Int32)expectedMismatchCount));
+
+
+			for (UInt32 i = 0;
+				i < result.textureCount;
+				++i)
+			{
+				const TextureInfo& texture =
+					result.textures[i];
+
+
+				GePrint(
+					String(
+						"------------------------------------------------------------"));
+
+
+				GePrint(
+					String(
+						"TEXTURE[") +
+					String::IntToString(
+					(Int32)i) +
+					String(
+						"]"));
+
+
+				if (!texture.valid)
+				{
+					GePrint(
+						String(
+							"  VALID : NO"));
+
+					continue;
+				}
+
+
+				GePrint(
+					String(
+						"  VALID : YES"));
+
+
+				GePrint(
+					String(
+						"  OFFSET : ") +
+					String::IntToString(
+					(Int32)texture.offset));
+
+
+				GePrint(
+					String(
+						"  SIGNATURE : ") +
+					UInt32ToHexString(
+						texture.signature));
+
+
+				GePrint(
+					String(
+						"  SUBTEXTURE COUNT : ") +
+					String::IntToString(
+					(Int32)texture.subTextureCount));
+
+
+				GePrint(
+					String(
+						"  MIPMAP COUNT : ") +
+					String::IntToString(
+					(Int32)texture.mipMapCount));
+
+
+				GePrint(
+					String(
+						"  ARRAY SIZE : ") +
+					String::IntToString(
+					(Int32)texture.arraySize));
+
+
+				for (size_t s = 0;
+					s < texture.subTextures.size();
+					++s)
+				{
+					const SubTextureInfo& sub =
+						texture.subTextures[s];
+
+
+					GePrint(
+						String(
+							"    SUBTEXTURE[") +
+						String::IntToString(
+						(Int32)s) +
+						String(
+							"]"));
+
+
+					if (!sub.valid)
+					{
+						GePrint(
+							String(
+								"      VALID : NO"));
+
+						continue;
+					}
+
+
+					GePrint(
+						String(
+							"      VALID : YES"));
+
+
+					GePrint(
+						String(
+							"      WIDTH : ") +
+						String::IntToString(
+							sub.width));
+
+
+					GePrint(
+						String(
+							"      HEIGHT : ") +
+						String::IntToString(
+							sub.height));
+
+
+					GePrint(
+						String(
+							"      FORMAT : ") +
+						String::IntToString(
+							sub.format) +
+						String(
+							" (") +
+						String(
+							GetTextureFormatName(
+								sub.format)) +
+						String(
+							")"));
+
+
+					GePrint(
+						String(
+							"      ID : ") +
+						String::IntToString(
+						(Int32)sub.id));
+
+
+					GePrint(
+						String(
+							"      DATA SIZE : ") +
+						String::IntToString(
+						(Int32)sub.dataSize));
+
+
+					GePrint(
+						String(
+							"      DATA OFFSET : ") +
+						String::IntToString(
+						(Int32)sub.dataOffset));
+
+
+					const UInt64 expectedSize =
+						CalculateExpectedDataSize(
+							sub.width,
+							sub.height,
+							sub.format);
+
+
+					if (expectedSize != 0)
+					{
+						GePrint(
+							String(
+								"      EXPECTED DATA SIZE : ") +
+							String::IntToString(
+							(Int32)
+								(expectedSize >
+									0x7FFFFFFFULL
+									? 0x7FFFFFFF
+									: expectedSize)));
+					}
+					else
+					{
+						GePrint(
+							String(
+								"      EXPECTED DATA SIZE : UNKNOWN"));
+					}
+
+
+					// ------------------------------------------------
+					// Payload validation
+					// ------------------------------------------------
+
+					Bool expectedSizeMatch =
+						false;
+
+
+					const Bool payloadValid =
+						ValidateSubTexturePayload(
+							data,
+							sub,
+							expectedSize,
+							expectedSizeMatch);
+
+
+					GePrint(
+						String(
+							"      PAYLOAD RANGE : ") +
+						String(
+							payloadValid
+							? "VALID"
+							: "INVALID"));
+
+
+					if (expectedSize != 0)
+					{
+						GePrint(
+							String(
+								"      PAYLOAD SIZE MATCH : ") +
+							String(
+								expectedSizeMatch
+								? "YES"
+								: "NO"));
+					}
+					else
+					{
+						GePrint(
+							String(
+								"      PAYLOAD SIZE MATCH : UNKNOWN"));
+					}
+
+
+					GePrint(
+						String(
+							"      PAYLOAD HEAD16 : ") +
+						PayloadHeadToString(
+							sub.data));
+
+
+					GePrint(
+						String(
+							"      BLOCK COMPRESSED : ") +
+						String(
+							IsBlockCompressed(
+								sub.format)
+							? "YES"
+							: "NO"));
+
+
+					GePrint(
+						String(
+							"      HAS ALPHA : ") +
+						String(
+							HasAlpha(
+								sub.format)
+							? "YES"
+							: "NO"));
+				}
+			}
+
+
+			GePrint(
+				String(
+					"============================================================"));
+
+			GePrint(
+				String(
+					"TEX.BIN ANALYSIS RESULT : ") +
+				String(
+					result.success
+					? "SUCCESS"
+					: "FAILED"));
+
+			GePrint(
+				String(
+					"PAYLOAD VALIDATION : ") +
+				String(
+					payloadInvalidCount == 0
+					? "SUCCESS"
+					: "CHECK REQUIRED"));
+
+			GePrint(
+				String(
+					"============================================================"));
+
+
+			return result.success;
 		}
-	}
-}
+
+
+	} // namespace TexBin
+} // namespace GPTDiva
